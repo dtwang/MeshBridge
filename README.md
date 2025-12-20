@@ -39,7 +39,10 @@
 - [ ] **多節點/多頻率 Preset**：支援同時管理多個 LoRa 節點或預設頻率切換。
 - [ ] **電子紙/留言板支援**：整合 E-Paper 顯示重要公告。
 - [ ] **Local 服務延伸**：整合離線地圖或物資回報系統。
+- [x] 簡易安裝腳本
 - [ ] 系統更新
+- [ ] 移除腳本
+- [ ] 英文版文件
 - [ ] QRcode
 - [ ] 類BBS系統
 - [ ] 系統公告
@@ -79,7 +82,25 @@ MeshBridge/
 
 ```
 
-## 安裝指南
+## 自動化安裝
+
+因為手動有點煩人
+```bash
+git clone https://github.com/SCWhite/MeshBridge.git
+cd MeshBridge
+
+chmod +x install.sh
+./install.sh
+```
+> [!IMPORTANT]
+> 注意: 目前預設WiFi Localisation 為 TW / 如果選項不同請自行修改
+>
+
+等腳本完全跑完，系統會提示重新開機
+重新啟動後就完成了
+
+
+## ~手動~安裝指南
 
 ### 1. 系統環境準備
 更新系統並安裝必要套件：
@@ -142,6 +163,11 @@ sudo ./setup_services.sh
 > [!NOTE]
 > 說明：此腳本會將專案中的 .service 檔案複製到系統目錄，並設定開機自動啟動。
 >
+
+用以下指令確認他有在執行:
+```
+sudo journalctl -u meshbridge.service -f
+```
 
 ## 常見問題 (Troubleshooting)
 
