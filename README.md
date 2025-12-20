@@ -92,7 +92,7 @@ sudo apt install python3-venv python3-pip dnsmasq git -y
 ### 2. 下載專案 
 
 ```bash
-git clone [https://github.com/SCWhite/MeshBridge.git](https://github.com/SCWhite/MeshBridge.git)
+git clone https://github.com/SCWhite/MeshBridge.git
 cd MeshBridge
 
 # 建立並啟動虛擬環境
