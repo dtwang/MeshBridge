@@ -1,0 +1,3 @@
+LOCAL_APP = "noteboard"
+
+BOARD_MESSAGE_CHANEL = 3
