@@ -151,8 +151,37 @@ def lora_msg_id_exists(lora_msg_id):
         print(f"檢查 lora_msg_id 是否存在失敗: {e}")
         return False
 
-def update_note_color(note_id, author_key, color_index, need_lora_update=False):
-    """更新 note 的背景顏色，需驗證 author_key"""
+def update_note_color(lora_msg_id, author_key, color_index, need_lora_update=False):
+    """透過 lora_msg_id 更新 note 的背景顏色，需驗證 author_key"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        bg_color = get_color_from_palette(color_index)
+        timestamp = int(time.time() * 1000)
+        
+        if need_lora_update:
+            cursor.execute('''
+                UPDATE notes 
+                SET bg_color = ?, updated_at = ?, rev = rev + 1, is_need_update_lora = 1
+                WHERE lora_msg_id = ? AND author_key = ?
+            ''', (bg_color, timestamp, lora_msg_id, author_key))
+        else:
+            cursor.execute('''
+                UPDATE notes 
+                SET bg_color = ?, updated_at = ?, rev = rev + 1
+                WHERE lora_msg_id = ? AND author_key = ?
+            ''', (bg_color, timestamp, lora_msg_id, author_key))
+        
+        affected_rows = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return affected_rows > 0
+    except Exception as e:
+        print(f"更新 note 顏色失敗: {e}")
+        return False
+
+def update_note_color_by_note_id(note_id, author_key, color_index, need_lora_update=False):
+    """透過 note_id 更新 note 的背景顏色，需驗證 author_key"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -180,7 +209,7 @@ def update_note_color(note_id, author_key, color_index, need_lora_update=False):
         print(f"更新 note 顏色失敗: {e}")
         return False
 
-def update_note_author(note_id, author_key):
+def update_note_author(lora_msg_id, author_key):
     """更新 note 的 author_key"""
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -190,8 +219,8 @@ def update_note_author(note_id, author_key):
         cursor.execute('''
             UPDATE notes 
             SET author_key = ?, updated_at = ?, rev = rev + 1
-            WHERE note_id = ?
-        ''', (author_key, timestamp, note_id))
+            WHERE lora_msg_id = ?
+        ''', (author_key, timestamp, lora_msg_id))
         
         affected_rows = cursor.rowcount
         conn.commit()
@@ -220,6 +249,27 @@ def archive_note(note_id, author_key, need_lora_update=False):
                 SET deleted = 1, updated_at = ?
                 WHERE note_id = ? AND author_key = ?
             ''', (timestamp, note_id, author_key))
+        
+        affected_rows = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return affected_rows > 0
+    except Exception as e:
+        print(f"封存 note 失敗: {e}")
+        return False
+
+def archive_note_by_lora_msg_id(lora_msg_id, author_key):
+    """透過 lora_msg_id 將 note 標記為已刪除 (deleted=1)，需驗證 author_key"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        timestamp = int(time.time() * 1000)
+        
+        cursor.execute('''
+            UPDATE notes 
+            SET deleted = 1, updated_at = ?
+            WHERE lora_msg_id = ? AND author_key = ?
+        ''', (timestamp, lora_msg_id, author_key))
         
         affected_rows = cursor.rowcount
         conn.commit()
@@ -499,25 +549,25 @@ def onReceive(packet, interface):
             request_id = packet['decoded'].get('requestId')
             if request_id and request_id in pending_ack:
                 note_info = pending_ack[request_id]
-                lora_msg_id = packet.get('id')
-                print(f"[收到 ACK] request_id={request_id}, lora_msg_id={lora_msg_id}")
+                ack_packet_id = packet.get('id')
+                lora_msg_id = str(request_id)
+                print(f"[收到 ACK] request_id={request_id}, lora_msg_id={ack_packet_id}")
                 
                 if update_note_status(note_info['note_id'], 'LoRa sent'):
                     print(f"  -> 已更新 note {note_info['note_id']} 狀態為 'LoRa sent'")
                     
                     try:
-                        if lora_msg_id:
-                            update_note_lora_msg_id(note_info['note_id'], str(lora_msg_id))
-                            print(f"  -> 已儲存 lora_msg_id: {lora_msg_id}")
-                            
-                            author_cmd = f"/author [{lora_msg_id}]{note_info['author_key']}"
-                            interface.sendText(author_cmd, channelIndex=get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME))
-                            print(f"  -> 已發送 author 命令: {author_cmd}")
-                            
-                            color_index = get_color_index_from_palette(note_info['bg_color'])
-                            color_cmd = f"/color [{lora_msg_id}]{note_info['author_key']}, {color_index}"
-                            interface.sendText(color_cmd, channelIndex=get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME))
-                            print(f"  -> 已發送 color 命令: {color_cmd}")
+                        update_note_lora_msg_id(note_info['note_id'], lora_msg_id)
+                        print(f"  -> 已儲存 lora_msg_id: {lora_msg_id} (使用 request_id)")
+                        
+                        author_cmd = f"/author [{lora_msg_id}]{note_info['author_key']}"
+                        interface.sendText(author_cmd, channelIndex=get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME))
+                        print(f"  -> 已發送 author 命令: {author_cmd}")
+                        
+                        color_index = get_color_index_from_palette(note_info['bg_color'])
+                        color_cmd = f"/color [{lora_msg_id}]{note_info['author_key']}, {color_index}"
+                        interface.sendText(color_cmd, channelIndex=get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME))
+                        print(f"  -> 已發送 color 命令: {color_cmd}")
                     except Exception as e:
                         print(f"  -> 發送後續命令失敗: {e}")
                     
@@ -591,46 +641,46 @@ def onReceive(packet, interface):
                     
             elif msg.startswith('/color [') and ']' in msg:
                 end_bracket = msg.index(']')
-                note_id = msg[8:end_bracket]
+                lora_msg_id = msg[8:end_bracket]
                 params = msg[end_bracket + 1:].strip()
                 
                 if ',' in params:
                     parts = params.split(',', 1)
                     author_key = parts[0].strip()
                     color_id = parts[1].strip()
-                    print(f"[設定顏色] note_id={note_id}, author_key={author_key}, color_id={color_id}")
+                    print(f"[設定顏色] lora_msg_id={lora_msg_id}, author_key={author_key}, color_id={color_id}")
                     
-                    if update_note_color(note_id, author_key, color_id):
-                        print(f"  -> 成功更新 note {note_id} 的顏色")
+                    if update_note_color(lora_msg_id, author_key, color_id):
+                        print(f"  -> 成功更新 note (lora_msg_id={lora_msg_id}) 的顏色")
                         should_refresh = True
                     else:
-                        print(f"  -> 更新失敗，note_id {note_id} 不存在或 author_key 不符")
+                        print(f"  -> 更新失敗，lora_msg_id {lora_msg_id} 不存在或 author_key 不符")
                 else:
-                    print(f"  -> 格式錯誤，應為 /color [note_id]author_key,color_id")
+                    print(f"  -> 格式錯誤，應為 /color [lora_msg_id]author_key,color_id")
                     
             elif msg.startswith('/author [') and ']' in msg:
                 end_bracket = msg.index(']')
-                note_id = msg[9:end_bracket]
+                lora_msg_id = msg[9:end_bracket]
                 author_key = msg[end_bracket + 1:].strip()
-                print(f"[更新作者] note_id={note_id}, author_key={author_key}")
+                print(f"[更新作者] lora_msg_id={lora_msg_id}, author_key={author_key}")
                 
-                if update_note_author(note_id, author_key):
-                    print(f"  -> 成功更新 note {note_id} 的 author_key 為 {author_key}")
+                if update_note_author(lora_msg_id, author_key):
+                    print(f"  -> 成功更新 note (lora_msg_id={lora_msg_id}) 的 author_key 為 {author_key}")
                     should_refresh = True
                 else:
-                    print(f"  -> 更新失敗，note_id {note_id} 可能不存在")
+                    print(f"  -> 更新失敗，lora_msg_id {lora_msg_id} 可能不存在")
                     
             elif msg.startswith('/archive [') and ']' in msg:
                 end_bracket = msg.index(']')
-                note_id = msg[10:end_bracket]
+                lora_msg_id = msg[10:end_bracket]
                 author_key = msg[end_bracket + 1:].strip()
-                print(f"[封存訊息] note_id={note_id}, author_key={author_key}")
+                print(f"[封存訊息] lora_msg_id={lora_msg_id}, author_key={author_key}")
                 
-                if archive_note(note_id, author_key):
-                    print(f"  -> 成功封存 note {note_id}")
+                if archive_note_by_lora_msg_id(lora_msg_id, author_key):
+                    print(f"  -> 成功封存 note (lora_msg_id={lora_msg_id})")
                     should_refresh = True
                 else:
-                    print(f"  -> 封存失敗，note_id {note_id} 不存在或 author_key 不符")
+                    print(f"  -> 封存失敗，lora_msg_id {lora_msg_id} 不存在或 author_key 不符")
                     
             elif msg.startswith('/reply <new>[') and ']' in msg:
                 end_bracket = msg.index(']', 13)
@@ -684,7 +734,12 @@ def onReceive(packet, interface):
         traceback.print_exc()
 
 def scan_for_meshtastic():
-    patterns = ["/dev/ttyACM*", "/dev/ttyUSB*"]
+    patterns = [
+        "/dev/ttyACM*",           # Linux
+        "/dev/ttyUSB*",           # Linux
+        "/dev/cu.usbserial-*",    # Mac
+        "/dev/cu.SLAB_USBtoUART*"    # Mac (CP210x driver)
+    ]
     found_ports = []
     for p in patterns:
         found_ports.extend(glob.glob(p))
@@ -1172,7 +1227,7 @@ def change_note_color(board_id, note_id):
         
         conn.close()
         
-        if update_note_color(note_id, author_key, color_index, need_lora_update=True):
+        if update_note_color_by_note_id(note_id, author_key, color_index, need_lora_update=True):
             socketio.emit('refresh_notes', {'board_id': board_id})
             return jsonify({
                 'success': True,
