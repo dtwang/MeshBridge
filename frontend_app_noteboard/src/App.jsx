@@ -818,12 +818,16 @@ function App() {
       return new Date(a.timestamp || 0) - new Date(b.timestamp || 0)
     })
     
-    // 找出整串便利貼的最後一張（用於回覆）
+    // 找出整串便利貼中所有有 loraMessageId 的便利貼
+    const allNotesWithLoraId = [note, ...sortedReplies].filter(n => n.loraMessageId)
+    
+    // 檢查是否正在回覆這串便利貼中的任何一張
+    const isReplyingToThisThread = isReplyingTo && allNotesWithLoraId.some(n => n.loraMessageId === isReplyingTo)
+    
+    // 找出整串便利貼的最後一張（用於顯示 add-reply-btn）
     const lastNote = sortedReplies.length > 0 ? sortedReplies[sortedReplies.length - 1] : note
     const lastNoteLoraMessageId = lastNote.loraMessageId
     const lastNoteStatus = lastNote.status
-    
-    const isReplyingToThis = isReplyingTo === lastNoteLoraMessageId && lastNoteLoraMessageId && lastNoteStatus !== 'LAN only'
     
     return (
       <div key={note.noteId || index} className="note-with-replies">
@@ -834,7 +838,7 @@ function App() {
           </div>
         )}
         
-        {isReplyingToThis ? (
+        {isReplyingToThisThread ? (
           <div className="reply-notes-container">
             <div 
               className="sticky-note draft-note reply-note"
@@ -884,7 +888,7 @@ function App() {
               </div>
             </div>
           </div>
-        ) : (lastNoteLoraMessageId && lastNoteStatus !== 'LAN only') ? (
+        ) : (!isReplyingTo && lastNoteLoraMessageId && lastNoteStatus !== 'LAN only') ? (
           <div className="reply-notes-container">
             <button 
               className="add-reply-btn"
