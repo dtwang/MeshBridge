@@ -547,13 +547,16 @@ header.header-hidden {
 .ack-counter {
   background: #1b5e20;
   color: white;
-  padding: 2px 8px;
-  border-radius: 10px;
-  font-size: 0.9em;
+  padding: 1px 5px;
+  border-radius: 8px;
+  font-size: 0.75em;
   font-weight: bold;
   cursor: pointer;
   transition: background-color 0.2s;
   user-select: none;
+  margin-left: 4px;
+  display: inline-block;
+  vertical-align: middle;
 }
 
 .ack-counter:hover {

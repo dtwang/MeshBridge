@@ -911,33 +911,60 @@ function App() {
                 title="點擊重新發送"
               >
                 {getStatusDisplay(status)}
+                <span 
+                  ref={(el) => {
+                    if (data.noteId) {
+                      ackCounterRefs.current[data.noteId] = el
+                    }
+                  }}
+                  className="ack-counter"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    if (ackTooltip === data.noteId) {
+                      setAckTooltip(null)
+                    } else {
+                      const rect = e.currentTarget.getBoundingClientRect()
+                      setAckTooltipPosition({
+                        top: rect.bottom + 8,
+                        left: rect.right - 150
+                      })
+                      setAckTooltip(data.noteId)
+                    }
+                  }}
+                >
+                  {(ackData[data.noteId] && ackData[data.noteId].length) || 0}
+                </span>
+              </span>
+            ) : (status === 'sent' || status === 'LoRa sent') ? (
+              <span className="note-status">
+                {getStatusDisplay(status)}
+                <span 
+                  ref={(el) => {
+                    if (data.noteId) {
+                      ackCounterRefs.current[data.noteId] = el
+                    }
+                  }}
+                  className="ack-counter"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    if (ackTooltip === data.noteId) {
+                      setAckTooltip(null)
+                    } else {
+                      const rect = e.currentTarget.getBoundingClientRect()
+                      setAckTooltipPosition({
+                        top: rect.bottom + 8,
+                        left: rect.right - 150
+                      })
+                      setAckTooltip(data.noteId)
+                    }
+                  }}
+                >
+                  {(ackData[data.noteId] && ackData[data.noteId].length) || 0}
+                </span>
               </span>
             ) : (
-              <span className="note-status">{getStatusDisplay(status)}</span>
-            )}
-            {data.noteId && ackData[data.noteId] && ackData[data.noteId].length > 0 && (
-              <span 
-                ref={(el) => {
-                  if (data.noteId) {
-                    ackCounterRefs.current[data.noteId] = el
-                  }
-                }}
-                className="ack-counter"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  if (ackTooltip === data.noteId) {
-                    setAckTooltip(null)
-                  } else {
-                    const rect = e.currentTarget.getBoundingClientRect()
-                    setAckTooltipPosition({
-                      top: rect.bottom + 8,
-                      left: rect.right - 150
-                    })
-                    setAckTooltip(data.noteId)
-                  }
-                }}
-              >
-                {ackData[data.noteId].length}
+              <span className="note-status">
+                {getStatusDisplay(status)}
               </span>
             )}
           </span>
@@ -1176,7 +1203,7 @@ function App() {
         </div>
       </div>
 
-      {!isCreatingNote && (
+      {!isCreatingNote && !isReplyingTo && (
         <button className="fab" onClick={handleCreateNote}>
           +
         </button>

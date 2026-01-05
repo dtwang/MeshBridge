@@ -124,6 +124,8 @@ def format_note_time(timestamp_ms):
     # 根據天數差異顯示相對時間
     if days_diff == 0:
         relative_time = "今天"
+    elif days_diff == 1:
+        relative_time = "昨天"
     else:
         relative_time = f"{days_diff}天前"
     
