@@ -84,6 +84,20 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_board_id ON notes(board_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON notes(created_at DESC)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_deleted ON notes(deleted)')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ack_records (
+            ack_id TEXT PRIMARY KEY,
+            note_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            lora_node_id TEXT NOT NULL,
+            FOREIGN KEY (note_id) REFERENCES notes(note_id)
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_ack_note_id ON ack_records(note_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_ack_created_at ON ack_records(created_at DESC)')
+    
     conn.commit()
     conn.close()
     print("資料庫初始化完成")
@@ -174,6 +188,57 @@ def lora_msg_id_exists(lora_msg_id):
         return count > 0
     except Exception as e:
         print(f"檢查 lora_msg_id 是否存在失敗: {e}")
+        return False
+
+def get_note_id_by_lora_msg_id(lora_msg_id):
+    """透過 lora_msg_id 取得 note_id"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('SELECT note_id FROM notes WHERE lora_msg_id = ?', (lora_msg_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"透過 lora_msg_id 取得 note_id 失敗: {e}")
+        return None
+
+def save_or_update_ack_record(note_id, lora_node_id):
+    """儲存或更新 ACK 記錄"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        timestamp = int(time.time() * 1000)
+        
+        cursor.execute('''
+            SELECT ack_id FROM ack_records 
+            WHERE note_id = ? AND lora_node_id = ?
+        ''', (note_id, lora_node_id))
+        
+        existing_record = cursor.fetchone()
+        
+        if existing_record:
+            cursor.execute('''
+                UPDATE ack_records 
+                SET updated_at = ?
+                WHERE note_id = ? AND lora_node_id = ?
+            ''', (timestamp, note_id, lora_node_id))
+            conn.commit()
+            conn.close()
+            print(f"  -> 已更新 ACK 記錄 (note_id={note_id}, lora_node_id={lora_node_id})")
+            return True
+        else:
+            ack_id = str(uuid.uuid4())
+            cursor.execute('''
+                INSERT INTO ack_records (ack_id, note_id, created_at, updated_at, lora_node_id)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (ack_id, note_id, timestamp, timestamp, lora_node_id))
+            conn.commit()
+            conn.close()
+            print(f"  -> 已新建 USER ACK 記錄 (ack_id={ack_id}, note_id={note_id}, lora_node_id={lora_node_id})")
+            return True
+    except Exception as e:
+        print(f"儲存或更新 USER ACK 記錄失敗: {e}")
         return False
 
 def update_note_color(lora_msg_id, author_key, color_index, need_lora_update=False):
@@ -538,6 +603,15 @@ def get_color_index_from_palette(bg_color):
     except Exception as e:
         return 0
 
+def send_ack_delayed(lora_msg_id, interface_obj, channel_name):
+    """延遲發送 USER ACK 命令"""
+    try:
+        ack_cmd = f"/ack {lora_msg_id}"
+        interface_obj.sendText(ack_cmd, channelIndex=get_channel_index(interface_obj, channel_name))
+        print(f"  -> [延遲 60 秒後] 已發送 USER ACK 命令: {ack_cmd}")
+    except Exception as e:
+        print(f"  -> [延遲 60 秒後] 發送 USER ACK 命令失敗: {e}")
+
 def onReceive(packet, interface):
     global pending_ack
     try:
@@ -616,6 +690,8 @@ def onReceive(packet, interface):
                     author_key=''
                 ):
                     should_refresh = True
+                    print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
+                    eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
                     
             elif msg.startswith('/msg [') and ']' in msg:
                 end_bracket = msg.index(']')
@@ -678,6 +754,23 @@ def onReceive(packet, interface):
                 else:
                     print(f"  -> 封存失敗，lora_msg_id {lora_msg_id} 不存在或 author_key 不符")
                     
+            elif msg.startswith('/ack '):
+                ack_lora_msg_id = msg[5:].strip()
+                print(f"[收到 ACK] lora_msg_id={ack_lora_msg_id}, from={lora_uuid}")
+                
+                note_id = get_note_id_by_lora_msg_id(ack_lora_msg_id)
+                if not note_id:
+                    print(f"  -> 錯誤：找不到 lora_msg_id={ack_lora_msg_id} 對應的 note")
+                else:
+                    if save_or_update_ack_record(note_id, lora_uuid):
+                        print(f"  -> 成功處理 USER ACK (note_id={note_id})")
+                        socketio.emit('ack_received', {
+                            'note_id': note_id,
+                            'lora_node_id': lora_uuid
+                        })
+                    else:
+                        print(f"  -> 處理 USER ACK 失敗")
+                    
             elif msg.startswith('/reply <new>[') and ']' in msg:
                 end_bracket = msg.index(']', 13)
                 parent_lora_msg_id = msg[13:end_bracket]
@@ -711,7 +804,8 @@ def onReceive(packet, interface):
                     conn.commit()
                     conn.close()
                     should_refresh = True
-                    print(f"  -> 成功儲存回覆訊息")
+                    print(f"  -> 成功儲存回覆訊息，將在 60 秒後發送 USER ACK 命令")
+                    eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
                 except Exception as e:
                     print(f"  -> 儲存回覆訊息失敗: {e}")
                     
@@ -1410,6 +1504,54 @@ def delete_board_note(board_id, note_id):
         
     except Exception as e:
         print(f"刪除 note 失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/boards/<board_id>/notes/<note_id>/acks', methods=['GET'])
+def get_note_acks(board_id, note_id):
+    """取得指定 note 的 ACK 記錄"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT ack_id, lora_node_id, created_at, updated_at
+            FROM ack_records
+            WHERE note_id = ?
+            ORDER BY created_at DESC
+        ''', (note_id,))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        acks = []
+        for row in rows:
+            lora_node_id = row['lora_node_id']
+            display_id = lora_node_id
+            if lora_node_id.startswith('lora-'):
+                raw_id = lora_node_id.replace('lora-', '')
+                display_id = f"LoRa-{raw_id[-4:]}" if len(raw_id) > 4 else raw_id
+            
+            acks.append({
+                'ackId': row['ack_id'],
+                'loraNodeId': lora_node_id,
+                'displayId': display_id,
+                'createdAt': row['created_at'],
+                'updatedAt': row['updated_at']
+            })
+        
+        return jsonify({
+            'success': True,
+            'note_id': note_id,
+            'acks': acks,
+            'count': len(acks)
+        }), 200
+        
+    except Exception as e:
+        print(f"取得 ACK 記錄失敗: {e}")
         return jsonify({
             'success': False,
             'error': str(e)

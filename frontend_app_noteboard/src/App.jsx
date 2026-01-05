@@ -84,6 +84,11 @@ function App() {
   const replyTextareaRef = useRef(null)
   const [newlyCreatedNoteId, setNewlyCreatedNoteId] = useState(null)
   const noteRefs = useRef({})
+  const [ackData, setAckData] = useState({})
+  const [ackTooltip, setAckTooltip] = useState(null)
+  const [ackTooltipPosition, setAckTooltipPosition] = useState({ top: 0, left: 0 })
+  const ackTooltipRef = useRef(null)
+  const ackCounterRefs = useRef({})
 
   const fetchNotes = async (includeDeleted = false, targetBoardId = null) => {
     try {
@@ -92,9 +97,54 @@ function App() {
       const data = await response.json()
       if (data.success) {
         setNotes(data.notes)
+        fetchAllAcks(data.notes, actualBoardId)
       }
     } catch (error) {
       console.error('Failed to fetch notes:', error)
+    }
+  }
+
+  const fetchAllAcks = async (notesList, targetBoardId = null) => {
+    const actualBoardId = targetBoardId || boardId
+    const newAckData = {}
+    
+    const allNotes = []
+    notesList.forEach(note => {
+      allNotes.push(note)
+      if (note.replyNotes) {
+        allNotes.push(...note.replyNotes)
+      }
+    })
+    
+    for (const note of allNotes) {
+      if (note.noteId) {
+        try {
+          const response = await fetch(`/api/boards/${actualBoardId}/notes/${note.noteId}/acks`)
+          const data = await response.json()
+          if (data.success) {
+            newAckData[note.noteId] = data.acks
+          }
+        } catch (error) {
+          console.error(`Failed to fetch ACKs for note ${note.noteId}:`, error)
+        }
+      }
+    }
+    
+    setAckData(newAckData)
+  }
+
+  const fetchAckForNote = async (noteId) => {
+    try {
+      const response = await fetch(`/api/boards/${boardId}/notes/${noteId}/acks`)
+      const data = await response.json()
+      if (data.success) {
+        setAckData(prev => ({
+          ...prev,
+          [noteId]: data.acks
+        }))
+      }
+    } catch (error) {
+      console.error(`Failed to fetch ACKs for note ${noteId}:`, error)
     }
   }
 
@@ -158,10 +208,19 @@ function App() {
       fetchNotes(showArchived, boardId)
     }
 
+    const handleAckReceived = (data) => {
+      console.log('ACK received:', data)
+      if (data.note_id) {
+        fetchAckForNote(data.note_id)
+      }
+    }
+
     socket.on('refresh_notes', handleRefreshNotes)
+    socket.on('ack_received', handleAckReceived)
 
     return () => {
       socket.off('refresh_notes', handleRefreshNotes)
+      socket.off('ack_received', handleAckReceived)
     }
   }, [socket, showArchived, boardId])
 
@@ -181,6 +240,24 @@ function App() {
       return () => clearTimeout(timer)
     }
   }, [sortOrder])
+
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (ackTooltip && ackTooltipRef.current && !ackTooltipRef.current.contains(event.target)) {
+        const ackCounter = event.target.closest('.ack-counter')
+        if (!ackCounter) {
+          setAckTooltip(null)
+        }
+      }
+    }
+
+    if (ackTooltip) {
+      document.addEventListener('mousedown', handleClickOutside)
+      return () => {
+        document.removeEventListener('mousedown', handleClickOutside)
+      }
+    }
+  }, [ackTooltip])
 
   useEffect(() => {
     const handleScroll = () => {
@@ -794,7 +871,34 @@ function App() {
         <div className="note-content">{highlightText(text, keywordFilter)}</div>
         <div className="note-footer">
           <span className="note-time">{time}</span>
-          <span className="note-status">{getStatusDisplay(status)}</span>
+          <span className="note-footer-right">
+            <span className="note-status">{getStatusDisplay(status)}</span>
+            {data.noteId && ackData[data.noteId] && ackData[data.noteId].length > 0 && (
+              <span 
+                ref={(el) => {
+                  if (data.noteId) {
+                    ackCounterRefs.current[data.noteId] = el
+                  }
+                }}
+                className="ack-counter"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  if (ackTooltip === data.noteId) {
+                    setAckTooltip(null)
+                  } else {
+                    const rect = e.currentTarget.getBoundingClientRect()
+                    setAckTooltipPosition({
+                      top: rect.bottom + 8,
+                      left: rect.right - 150
+                    })
+                    setAckTooltip(data.noteId)
+                  }
+                }}
+              >
+                {ackData[data.noteId].length}
+              </span>
+            )}
+          </span>
         </div>
         {canEdit && (
           <div className="note-actions">
@@ -1084,6 +1188,35 @@ function App() {
                 確定
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {ackTooltip && ackData[ackTooltip] && (
+        <div 
+          className="ack-tooltip" 
+          ref={ackTooltipRef}
+          style={{
+            top: `${ackTooltipPosition.top}px`,
+            left: `${ackTooltipPosition.left}px`
+          }}
+        >
+          <button 
+            className="ack-tooltip-close"
+            onClick={(e) => {
+              e.stopPropagation()
+              setAckTooltip(null)
+            }}
+          >
+            ✕
+          </button>
+          <div className="ack-tooltip-header">已收到的節點</div>
+          <div className="ack-tooltip-list">
+            {ackData[ackTooltip].map((ack, idx) => (
+              <div key={ack.ackId || idx} className="ack-tooltip-item">
+                {ack.displayId}
+              </div>
+            ))}
           </div>
         </div>
       )}
