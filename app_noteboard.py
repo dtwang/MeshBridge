@@ -14,6 +14,15 @@ from meshtastic.serial_interface import SerialInterface
 from pubsub import pub
 from config import BOARD_MESSAGE_CHANEL_NAME, SEND_INTERVAL_SECOND, ACK_TIMEOUT_SECONDS, MAX_NOTE_SHOW, MAX_ARCHIVED_NOTE_SHOW
 
+# 驗證 BOARD_MESSAGE_CHANEL_NAME 設定
+FORBIDDEN_CHANNEL_NAMES = ["MeshTW", "Emergency!"]
+
+if not BOARD_MESSAGE_CHANEL_NAME or BOARD_MESSAGE_CHANEL_NAME.strip() == "":
+    raise ValueError("BOARD_MESSAGE_CHANEL_NAME 不得為空")
+
+if BOARD_MESSAGE_CHANEL_NAME in FORBIDDEN_CHANNEL_NAMES:
+    raise ValueError(f"BOARD_MESSAGE_CHANEL_NAME 不得為: {', '.join(FORBIDDEN_CHANNEL_NAMES)}")
+
 app = Flask(__name__, 
                template_folder='templates/app_noteboard',
                static_folder='static/app_noteboard')
@@ -1044,8 +1053,14 @@ def validate_channel_name(interface):
         
         for ch in interface.localNode.channels:
             if ch.settings and ch.settings.name == BOARD_MESSAGE_CHANEL_NAME:
+                if ch.index == 0:
+                    channel_validated = False
+                    error_msg = f"Channel '{BOARD_MESSAGE_CHANEL_NAME}' 的 Index 不可以為 0"
+                    print(f"[✗] {error_msg}")
+                    return (False, error_msg)
+                
                 channel_validated = True
-                print(f"[✓] Channel 名稱驗證成功: '{BOARD_MESSAGE_CHANEL_NAME}'")
+                print(f"[✓] Channel 名稱驗證成功: '{BOARD_MESSAGE_CHANEL_NAME}' (Index: {ch.index})")
                 return (True, None)
         
         channel_validated = False
