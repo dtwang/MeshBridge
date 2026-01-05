@@ -610,6 +610,35 @@ function App() {
     return handleDeleteNote(noteId, false)
   }
 
+  const handleResendNote = async (noteId) => {
+    const confirmed = await showConfirm('確認重新發送訊息？', '重新發送')
+    if (!confirmed) {
+      return
+    }
+
+    try {
+      const response = await fetch(`/api/boards/${boardId}/notes/${noteId}/resend`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          author_key: myUUID
+        })
+      })
+
+      const data = await response.json()
+      if (data.success) {
+        showAlert(`已重新發送訊息 (第 ${data.resent_count} 次)`, '成功')
+      } else {
+        showAlert('重新發送失敗：' + (data.error || '未知錯誤'), '錯誤')
+      }
+    } catch (error) {
+      console.error('Failed to resend note:', error)
+      showAlert('重新發送失敗：' + error.message, '錯誤')
+    }
+  }
+
   const handleOpenColorPicker = (note) => {
     const colorIndex = COLOR_PALETTE.findIndex(c => c === note.bgColor)
     setSelectedColorIndex(colorIndex >= 0 ? colorIndex : 0)
@@ -872,7 +901,20 @@ function App() {
         <div className="note-footer">
           <span className="note-time">{time}</span>
           <span className="note-footer-right">
-            <span className="note-status">{getStatusDisplay(status)}</span>
+            {(status === 'sent' || status === 'LoRa sent') && data.userId === myUUID && !data.archived ? (
+              <span 
+                className="note-status clickable"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  handleResendNote(data.noteId)
+                }}
+                title="點擊重新發送"
+              >
+                {getStatusDisplay(status)}
+              </span>
+            ) : (
+              <span className="note-status">{getStatusDisplay(status)}</span>
+            )}
             {data.noteId && ackData[data.noteId] && ackData[data.noteId].length > 0 && (
               <span 
                 ref={(el) => {
@@ -1142,7 +1184,7 @@ function App() {
 
       <footer className="app-footer">
         <div className="footer-left">uid={myUUID}</div>
-        <div className="footer-right">mqBoard v0.1.0</div>
+        <div className="footer-right">MeshNoteboard v0.2.0</div>
       </footer>
 
       {modalConfig.show && (

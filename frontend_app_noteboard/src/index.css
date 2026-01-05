@@ -530,6 +530,20 @@ header.header-hidden {
   font-size: 0.9em;
 }
 
+.note-status.clickable {
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.note-status.clickable:hover {
+  background: rgba(230, 126, 34, 0.4);
+  transform: scale(1.05);
+}
+
+.note-status.clickable:active {
+  transform: scale(0.95);
+}
+
 .ack-counter {
   background: #1b5e20;
   color: white;

@@ -708,6 +708,24 @@ def onReceive(packet, interface):
                         author_key=''
                     ):
                         should_refresh = True
+                        print(f"[重發訊息寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
+                        print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
+                        eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                        # 更新以此訊息為父訊息的回覆，將 is_temp_parent_note 設為 0
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            cursor = conn.cursor()
+                            cursor.execute('''
+                                UPDATE notes SET is_temp_parent_note = 0
+                                WHERE reply_lora_msg_id = ? AND is_temp_parent_note = 1
+                            ''', (resend_lora_msg_id,))
+                            updated_count = cursor.rowcount
+                            conn.commit()
+                            conn.close()
+                            if updated_count > 0:
+                                print(f"  -> 已更新 {updated_count} 筆回覆的 is_temp_parent_note 為 0")
+                        except Exception as e:
+                            print(f"  -> 更新 is_temp_parent_note 失敗: {e}")
                 else:
                     print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過")
                     
@@ -808,6 +826,70 @@ def onReceive(packet, interface):
                     eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
                 except Exception as e:
                     print(f"  -> 儲存回覆訊息失敗: {e}")
+                    
+            elif msg.startswith('/reply <') and '>[' in msg and ']' in msg:
+                # 重發回覆格式: /reply <resend_lora_msg_id>[parent_lora_msg_id]body
+                # resend_lora_msg_id 是這則回覆的 lora_msg_id
+                # parent_lora_msg_id 是父訊息的 lora_msg_id
+                end_angle = msg.index('>')
+                resend_lora_msg_id = msg[8:end_angle]  # <xxxx> 中的值作為此回覆的 lora_msg_id
+                
+                start_bracket = end_angle + 1
+                if msg[start_bracket] != '[':
+                    print(f"[格式錯誤] /reply 重發格式應為 /reply <lora_msg_id>[parent_lora_msg_id]body")
+                else:
+                    end_bracket = msg.index(']', start_bracket)
+                    parent_lora_msg_id = msg[start_bracket + 1:end_bracket]
+                    body = msg[end_bracket + 1:]
+                    print(f"[重發回覆訊息] resend_lora_msg_id={resend_lora_msg_id}, parent_lora_msg_id={parent_lora_msg_id}, body={body}")
+                    
+                    # 檢查此回覆是否已存在
+                    if not lora_msg_id_exists(resend_lora_msg_id):
+                        is_temp_parent = 0
+                        
+                        if lora_msg_id_exists(parent_lora_msg_id):
+                            reply_lora_msg_id = parent_lora_msg_id
+                            print(f"  -> 找到父訊息 lora_msg_id: {parent_lora_msg_id}")
+                        else:
+                            reply_lora_msg_id = parent_lora_msg_id
+                            is_temp_parent = 1
+                            print(f"  -> 父訊息 lora_msg_id {parent_lora_msg_id} 不存在本機，仍將 reply_lora_msg_id 設為 {parent_lora_msg_id}，並設定 is_temp_parent_note=1")
+                        
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            cursor = conn.cursor()
+                            timestamp = int(time.time() * 1000)
+                            status = 'LoRa received'
+                            reply_note_id = generate_note_id()
+                            
+                            cursor.execute('''
+                                INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
+                                                 created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+                            ''', (reply_note_id, reply_lora_msg_id, BOARD_MESSAGE_CHANEL_NAME, body, '', status, 
+                                  timestamp, timestamp, '', resend_lora_msg_id, is_temp_parent))
+                            
+                            conn.commit()
+                            
+                            # 更新以此回覆為父訊息的其他回覆，將 is_temp_parent_note 設為 0
+                            cursor.execute('''
+                                UPDATE notes SET is_temp_parent_note = 0
+                                WHERE reply_lora_msg_id = ? AND is_temp_parent_note = 1
+                            ''', (resend_lora_msg_id,))
+                            updated_count = cursor.rowcount
+                            conn.commit()
+                            conn.close()
+                            
+                            should_refresh = True
+                            print(f"[重發回覆寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
+                            print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
+                            eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                            if updated_count > 0:
+                                print(f"  -> 已更新 {updated_count} 筆回覆的 is_temp_parent_note 為 0")
+                        except Exception as e:
+                            print(f"  -> 儲存重發回覆訊息失敗: {e}")
+                    else:
+                        print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過")
                     
             else:
                 if not msg.startswith('/'):
@@ -1563,6 +1645,130 @@ def delete_board_note(board_id, note_id):
         
     except Exception as e:
         print(f"刪除 note 失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/boards/<board_id>/notes/<note_id>/resend', methods=['POST'])
+def resend_board_note(board_id, note_id):
+    """重新發送 note (僅限 status 為 LoRa sent 的 note)"""
+    global interface, lora_connected, pending_ack
+    try:
+        data = request.get_json() or {}
+        author_key = data.get('author_key', 'user-unknown')
+        
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT note_id, status, author_key, body, bg_color, lora_msg_id, reply_lora_msg_id, resent_count
+            FROM notes 
+            WHERE note_id = ? AND board_id = ? AND deleted = 0
+        ''', (note_id, board_id))
+        
+        result = cursor.fetchone()
+        if not result:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'Note not found'
+            }), 404
+        
+        status = result['status']
+        db_author_key = result['author_key']
+        body = result['body']
+        bg_color = result['bg_color']
+        lora_msg_id = result['lora_msg_id']
+        reply_lora_msg_id = result['reply_lora_msg_id']
+        resent_count = result['resent_count']
+        
+        if status != 'LoRa sent':
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'Only LoRa sent notes can be resent'
+            }), 403
+        
+        if db_author_key != author_key:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'Not authorized to resend this note'
+            }), 403
+        
+        if not lora_msg_id:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'Note has no lora_msg_id'
+            }), 400
+        
+        if not interface or not lora_connected:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'LoRa not connected'
+            }), 503
+        
+        # 更新 resent_count
+        timestamp = int(time.time() * 1000)
+        cursor.execute('''
+            UPDATE notes 
+            SET resent_count = resent_count + 1, updated_at = ?
+            WHERE note_id = ?
+        ''', (timestamp, note_id))
+        conn.commit()
+        conn.close()
+        
+        # 根據是否為回覆決定使用 /msg 或 /reply 指令
+        try:
+            channel_index = get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME)
+            
+            if reply_lora_msg_id:
+                # 是回覆，使用 /reply 指令
+                msg = f"/reply <{lora_msg_id}>[{reply_lora_msg_id}]{body}"
+                print(f"[重新發送] 使用 /reply 指令: {msg}")
+            else:
+                # 不是回覆，使用 /msg 指令
+                msg = f"/msg [{lora_msg_id}]{body}"
+                print(f"[重新發送] 使用 /msg 指令: {msg}")
+            
+            interface.sendText(msg, channelIndex=channel_index)
+            print(f"  -> 已發送重新發送命令 (note_id={note_id}, resent_count={resent_count + 1})")
+            
+            # 發送 author 命令
+            author_cmd = f"/author [{lora_msg_id}]{db_author_key}"
+            interface.sendText(author_cmd, channelIndex=channel_index)
+            print(f"  -> 已發送 author 命令: {author_cmd}")
+            
+            # 發送 color 命令
+            color_index = get_color_index_from_palette(bg_color)
+            color_cmd = f"/color [{lora_msg_id}]{db_author_key}, {color_index}"
+            interface.sendText(color_cmd, channelIndex=channel_index)
+            print(f"  -> 已發送 color 命令: {color_cmd}")
+            
+            socketio.emit('refresh_notes', {'board_id': board_id})
+            
+            return jsonify({
+                'success': True,
+                'note_id': note_id,
+                'board_id': board_id,
+                'resent_count': resent_count + 1
+            }), 200
+            
+        except Exception as e:
+            print(f"[重新發送] 發送失敗: {e}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({
+                'success': False,
+                'error': f'Failed to send: {str(e)}'
+            }), 500
+        
+    except Exception as e:
+        print(f"重新發送 note 失敗: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
