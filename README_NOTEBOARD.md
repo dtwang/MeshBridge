@@ -115,7 +115,7 @@ NoteBoard 使用特定格式的文字訊息在 Meshmatic LoRa 網路的Channel�
 
 ---
 
-### 4.2 重發留言(用來補發送未收到的訊息用，尚未實作)
+### 4.2 重發留言
 
 **格式**：`/msg [<lora_msg_id>]<留言內容>`
 
@@ -205,7 +205,7 @@ NoteBoard 使用特定格式的文字訊息在 Meshmatic LoRa 網路的Channel�
 - 如果父留言不存在於本地資料庫，系統會設定 `is_temp_parent_note=1`
 - 支援多層級回覆（回覆的回覆）
 
-### 4.7 重送回覆留言(用來補發送未收到的訊息用，尚未實作)
+### 4.7 重送回覆留言
 
 **格式**：`/reply <lora_msg_id>[<parent_lora_msg_id>]<留言內容>`
 
@@ -217,6 +217,23 @@ NoteBoard 使用特定格式的文字訊息在 Meshmatic LoRa 網路的Channel�
 /reply <0123456789>[1234567890]這是對該留言的回覆
 ```
 
+---
+
+### 4.8 使用者 ACK 確認
+
+**格式**：`/ack <lora_msg_id>`
+
+**用途**：當接收到新留言後，延遲 60 秒自動發送 ACK 確認，通知發送者該留言已被接收
+
+**範例**：
+```
+/ack 1234567890
+```
+
+**說明**：
+- 系統在接收到 `/msg [new]` 或 `/msg [<lora_msg_id>]` 或 `/reply` 指令後，會自動在 60 秒後發送 ACK
+- ACK 記錄會儲存至 `ack_records` 資料表，記錄哪些節點已確認接收此留言
+- 發送者可透過 ACK 記錄了解留言的傳播狀況
 
 ---
 
@@ -267,6 +284,32 @@ NoteBoard 使用特定格式的文字訊息在 Meshmatic LoRa 網路的Channel�
 | `idx_board_id` | `board_id` | 加速依留言板查詢 |
 | `idx_created_at` | `created_at DESC` | 加速依時間排序查詢 |
 | `idx_deleted` | `deleted` | 加速過濾已封存留言 |
+
+---
+
+### 資料表：ack_records
+
+**用途**：記錄使用者 ACK 確認，追蹤哪些 LoRa 節點已確認接收特定留言
+
+| 欄位名稱 | 資料型別 | 約束條件 | 預設值 | 說明 |
+|---------|---------|---------|--------|------|
+| `ack_id` | TEXT | PRIMARY KEY | - | ACK 記錄唯一識別碼（UUID v4） |
+| `note_id` | TEXT | NOT NULL, FOREIGN KEY | - | 關聯的留言 ID（對應 `notes.note_id`） |
+| `created_at` | INTEGER | NOT NULL | - | 建立時間戳記（毫秒） |
+| `updated_at` | INTEGER | NOT NULL | - | 更新時間戳記（毫秒） |
+| `lora_node_id` | TEXT | NOT NULL | - | 發送 ACK 的 LoRa 節點 ID（格式：`lora-<device_id>`） |
+
+### 索引
+
+| 索引名稱 | 欄位 | 說明 |
+|---------|------|------|
+| `idx_ack_note_id` | `note_id` | 加速依留言查詢 ACK 記錄 |
+| `idx_ack_created_at` | `created_at DESC` | 加速依時間排序查詢 |
+
+**說明**：
+- 每個 `note_id` 和 `lora_node_id` 的組合是唯一的（同一節點對同一留言只記錄一次 ACK）
+- 如果同一節點重複發送 ACK，系統會更新 `updated_at` 時間戳記
+- ACK 記錄用於追蹤留言的傳播狀況，幫助使用者了解哪些節點已接收到留言
 
 ### 欄位說明補充
 
@@ -589,12 +632,103 @@ NoteBoard 使用特定格式的文字訊息在 Meshmatic LoRa 網路的Channel�
 
 ---
 
+### 6.8 重新發送留言
+
+**端點**：`POST /api/boards/<board_id>/notes/<note_id>/resend`
+
+**參數**：
+- `board_id`（路徑參數）：留言板 ID
+- `note_id`（路徑參數）：留言 ID
+
+**請求 Body**：
+```json
+{
+  "author_key": "user-abc12345"
+}
+```
+
+**說明**：重新發送已成功發送至 LoRa 的留言（`status` 為 `LoRa sent`），用於補發未被其他節點接收到的訊息
+
+**功能**：
+- 僅限作者本人且狀態為 `LoRa sent` 的留言
+- 自動遞增 `resent_count` 計數器
+- 根據留言類型自動選擇：
+  - 一般留言：使用 `/msg [<lora_msg_id>]<內容>` 格式
+  - 回覆留言：使用 `/reply <lora_msg_id>[<parent_lora_msg_id>]<內容>` 格式
+- 自動發送 `/author` 和 `/color` 後續指令
+
+**回應範例**：
+```json
+{
+  "success": true,
+  "note_id": "uuid-1234",
+  "board_id": "YourChannelName",
+  "resent_count": 1
+}
+```
+
+**錯誤回應**：
+```json
+{
+  "success": false,
+  "error": "Only LoRa sent notes can be resent"
+}
+```
+
+---
+
+### 6.9 取得留言的 ACK 記錄
+
+**端點**：`GET /api/boards/<board_id>/notes/<note_id>/acks`
+
+**參數**：
+- `board_id`（路徑參數）：留言板 ID
+- `note_id`（路徑參數）：留言 ID
+
+**說明**：取得指定留言的所有 ACK 確認記錄，顯示哪些 LoRa 節點已確認接收此留言
+
+**回應範例**：
+```json
+{
+  "success": true,
+  "note_id": "uuid-1234",
+  "acks": [
+    {
+      "ackId": "ack-uuid-5678",
+      "loraNodeId": "lora-a1b2c3d4",
+      "displayId": "LoRa-c3d4",
+      "createdAt": 1735456200000,
+      "updatedAt": 1735456200000
+    },
+    {
+      "ackId": "ack-uuid-9012",
+      "loraNodeId": "lora-e5f6g7h8",
+      "displayId": "LoRa-g7h8",
+      "createdAt": 1735456260000,
+      "updatedAt": 1735456260000
+    }
+  ],
+  "count": 2
+}
+```
+
+**說明**：
+- `ackId`：ACK 記錄的唯一識別碼
+- `loraNodeId`：發送 ACK 的 LoRa 節點完整 ID
+- `displayId`：節點 ID 的顯示名稱（簡化版）
+- `createdAt`：首次接收 ACK 的時間戳記
+- `updatedAt`：最後一次接收 ACK 的時間戳記
+- ACK 記錄按建立時間降序排列（最新的在前）
+
+---
+
 ### API 權限說明
 
-- **作者驗證**：所有修改操作（更新、刪除、封存、變更顏色）都需要提供正確的 `author_key`
+- **作者驗證**：所有修改操作（更新、刪除、封存、變更顏色、重新發送）都需要提供正確的 `author_key`
 - **狀態限制**：
   - `LAN only` 留言：可編輯、可刪除
-  - `LoRa sent` / `LoRa received` 留言：僅可變更顏色或封存，不可編輯內容或直接刪除
+  - `LoRa sent` 留言：僅可變更顏色、封存或重新發送，不可編輯內容或直接刪除
+  - `LoRa received` 留言：僅可變更顏色或封存，不可編輯內容或直接刪除
 
 ---
 

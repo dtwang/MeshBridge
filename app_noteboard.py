@@ -14,6 +14,15 @@ from meshtastic.serial_interface import SerialInterface
 from pubsub import pub
 from config import BOARD_MESSAGE_CHANEL_NAME, SEND_INTERVAL_SECOND, ACK_TIMEOUT_SECONDS, MAX_NOTE_SHOW, MAX_ARCHIVED_NOTE_SHOW
 
+# 驗證 BOARD_MESSAGE_CHANEL_NAME 設定
+FORBIDDEN_CHANNEL_NAMES = ["MeshTW", "Emergency!"]
+
+if not BOARD_MESSAGE_CHANEL_NAME or BOARD_MESSAGE_CHANEL_NAME.strip() == "":
+    raise ValueError("BOARD_MESSAGE_CHANEL_NAME 不得為空")
+
+if BOARD_MESSAGE_CHANEL_NAME in FORBIDDEN_CHANNEL_NAMES:
+    raise ValueError(f"BOARD_MESSAGE_CHANEL_NAME 不得為: {', '.join(FORBIDDEN_CHANNEL_NAMES)}")
+
 app = Flask(__name__, 
                template_folder='templates/app_noteboard',
                static_folder='static/app_noteboard')
@@ -84,6 +93,20 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_board_id ON notes(board_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON notes(created_at DESC)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_deleted ON notes(deleted)')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ack_records (
+            ack_id TEXT PRIMARY KEY,
+            note_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            lora_node_id TEXT NOT NULL,
+            FOREIGN KEY (note_id) REFERENCES notes(note_id)
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_ack_note_id ON ack_records(note_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_ack_created_at ON ack_records(created_at DESC)')
+    
     conn.commit()
     conn.close()
     print("資料庫初始化完成")
@@ -110,6 +133,8 @@ def format_note_time(timestamp_ms):
     # 根據天數差異顯示相對時間
     if days_diff == 0:
         relative_time = "今天"
+    elif days_diff == 1:
+        relative_time = "昨天"
     else:
         relative_time = f"{days_diff}天前"
     
@@ -174,6 +199,57 @@ def lora_msg_id_exists(lora_msg_id):
         return count > 0
     except Exception as e:
         print(f"檢查 lora_msg_id 是否存在失敗: {e}")
+        return False
+
+def get_note_id_by_lora_msg_id(lora_msg_id):
+    """透過 lora_msg_id 取得 note_id"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('SELECT note_id FROM notes WHERE lora_msg_id = ?', (lora_msg_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"透過 lora_msg_id 取得 note_id 失敗: {e}")
+        return None
+
+def save_or_update_ack_record(note_id, lora_node_id):
+    """儲存或更新 ACK 記錄"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        timestamp = int(time.time() * 1000)
+        
+        cursor.execute('''
+            SELECT ack_id FROM ack_records 
+            WHERE note_id = ? AND lora_node_id = ?
+        ''', (note_id, lora_node_id))
+        
+        existing_record = cursor.fetchone()
+        
+        if existing_record:
+            cursor.execute('''
+                UPDATE ack_records 
+                SET updated_at = ?
+                WHERE note_id = ? AND lora_node_id = ?
+            ''', (timestamp, note_id, lora_node_id))
+            conn.commit()
+            conn.close()
+            print(f"  -> 已更新 ACK 記錄 (note_id={note_id}, lora_node_id={lora_node_id})")
+            return True
+        else:
+            ack_id = str(uuid.uuid4())
+            cursor.execute('''
+                INSERT INTO ack_records (ack_id, note_id, created_at, updated_at, lora_node_id)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (ack_id, note_id, timestamp, timestamp, lora_node_id))
+            conn.commit()
+            conn.close()
+            print(f"  -> 已新建 USER ACK 記錄 (ack_id={ack_id}, note_id={note_id}, lora_node_id={lora_node_id})")
+            return True
+    except Exception as e:
+        print(f"儲存或更新 USER ACK 記錄失敗: {e}")
         return False
 
 def update_note_color(lora_msg_id, author_key, color_index, need_lora_update=False):
@@ -538,6 +614,15 @@ def get_color_index_from_palette(bg_color):
     except Exception as e:
         return 0
 
+def send_ack_delayed(lora_msg_id, interface_obj, channel_name):
+    """延遲發送 USER ACK 命令"""
+    try:
+        ack_cmd = f"/ack {lora_msg_id}"
+        interface_obj.sendText(ack_cmd, channelIndex=get_channel_index(interface_obj, channel_name))
+        print(f"  -> [延遲 60 秒後] 已發送 USER ACK 命令: {ack_cmd}")
+    except Exception as e:
+        print(f"  -> [延遲 60 秒後] 發送 USER ACK 命令失敗: {e}")
+
 def onReceive(packet, interface):
     global pending_ack
     try:
@@ -616,6 +701,8 @@ def onReceive(packet, interface):
                     author_key=''
                 ):
                     should_refresh = True
+                    print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
+                    eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
                     
             elif msg.startswith('/msg [') and ']' in msg:
                 end_bracket = msg.index(']')
@@ -632,6 +719,24 @@ def onReceive(packet, interface):
                         author_key=''
                     ):
                         should_refresh = True
+                        print(f"[重發訊息寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
+                        print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
+                        eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                        # 更新以此訊息為父訊息的回覆，將 is_temp_parent_note 設為 0
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            cursor = conn.cursor()
+                            cursor.execute('''
+                                UPDATE notes SET is_temp_parent_note = 0
+                                WHERE reply_lora_msg_id = ? AND is_temp_parent_note = 1
+                            ''', (resend_lora_msg_id,))
+                            updated_count = cursor.rowcount
+                            conn.commit()
+                            conn.close()
+                            if updated_count > 0:
+                                print(f"  -> 已更新 {updated_count} 筆回覆的 is_temp_parent_note 為 0")
+                        except Exception as e:
+                            print(f"  -> 更新 is_temp_parent_note 失敗: {e}")
                 else:
                     print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過")
                     
@@ -678,6 +783,23 @@ def onReceive(packet, interface):
                 else:
                     print(f"  -> 封存失敗，lora_msg_id {lora_msg_id} 不存在或 author_key 不符")
                     
+            elif msg.startswith('/ack '):
+                ack_lora_msg_id = msg[5:].strip()
+                print(f"[收到 ACK] lora_msg_id={ack_lora_msg_id}, from={lora_uuid}")
+                
+                note_id = get_note_id_by_lora_msg_id(ack_lora_msg_id)
+                if not note_id:
+                    print(f"  -> 錯誤：找不到 lora_msg_id={ack_lora_msg_id} 對應的 note")
+                else:
+                    if save_or_update_ack_record(note_id, lora_uuid):
+                        print(f"  -> 成功處理 USER ACK (note_id={note_id})")
+                        socketio.emit('ack_received', {
+                            'note_id': note_id,
+                            'lora_node_id': lora_uuid
+                        })
+                    else:
+                        print(f"  -> 處理 USER ACK 失敗")
+                    
             elif msg.startswith('/reply <new>[') and ']' in msg:
                 end_bracket = msg.index(']', 13)
                 parent_lora_msg_id = msg[13:end_bracket]
@@ -711,9 +833,74 @@ def onReceive(packet, interface):
                     conn.commit()
                     conn.close()
                     should_refresh = True
-                    print(f"  -> 成功儲存回覆訊息")
+                    print(f"  -> 成功儲存回覆訊息，將在 60 秒後發送 USER ACK 命令")
+                    eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
                 except Exception as e:
                     print(f"  -> 儲存回覆訊息失敗: {e}")
+                    
+            elif msg.startswith('/reply <') and '>[' in msg and ']' in msg:
+                # 重發回覆格式: /reply <resend_lora_msg_id>[parent_lora_msg_id]body
+                # resend_lora_msg_id 是這則回覆的 lora_msg_id
+                # parent_lora_msg_id 是父訊息的 lora_msg_id
+                end_angle = msg.index('>')
+                resend_lora_msg_id = msg[8:end_angle]  # <xxxx> 中的值作為此回覆的 lora_msg_id
+                
+                start_bracket = end_angle + 1
+                if msg[start_bracket] != '[':
+                    print(f"[格式錯誤] /reply 重發格式應為 /reply <lora_msg_id>[parent_lora_msg_id]body")
+                else:
+                    end_bracket = msg.index(']', start_bracket)
+                    parent_lora_msg_id = msg[start_bracket + 1:end_bracket]
+                    body = msg[end_bracket + 1:]
+                    print(f"[重發回覆訊息] resend_lora_msg_id={resend_lora_msg_id}, parent_lora_msg_id={parent_lora_msg_id}, body={body}")
+                    
+                    # 檢查此回覆是否已存在
+                    if not lora_msg_id_exists(resend_lora_msg_id):
+                        is_temp_parent = 0
+                        
+                        if lora_msg_id_exists(parent_lora_msg_id):
+                            reply_lora_msg_id = parent_lora_msg_id
+                            print(f"  -> 找到父訊息 lora_msg_id: {parent_lora_msg_id}")
+                        else:
+                            reply_lora_msg_id = parent_lora_msg_id
+                            is_temp_parent = 1
+                            print(f"  -> 父訊息 lora_msg_id {parent_lora_msg_id} 不存在本機，仍將 reply_lora_msg_id 設為 {parent_lora_msg_id}，並設定 is_temp_parent_note=1")
+                        
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            cursor = conn.cursor()
+                            timestamp = int(time.time() * 1000)
+                            status = 'LoRa received'
+                            reply_note_id = generate_note_id()
+                            
+                            cursor.execute('''
+                                INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
+                                                 created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+                            ''', (reply_note_id, reply_lora_msg_id, BOARD_MESSAGE_CHANEL_NAME, body, '', status, 
+                                  timestamp, timestamp, '', resend_lora_msg_id, is_temp_parent))
+                            
+                            conn.commit()
+                            
+                            # 更新以此回覆為父訊息的其他回覆，將 is_temp_parent_note 設為 0
+                            cursor.execute('''
+                                UPDATE notes SET is_temp_parent_note = 0
+                                WHERE reply_lora_msg_id = ? AND is_temp_parent_note = 1
+                            ''', (resend_lora_msg_id,))
+                            updated_count = cursor.rowcount
+                            conn.commit()
+                            conn.close()
+                            
+                            should_refresh = True
+                            print(f"[重發回覆寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
+                            print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
+                            eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                            if updated_count > 0:
+                                print(f"  -> 已更新 {updated_count} 筆回覆的 is_temp_parent_note 為 0")
+                        except Exception as e:
+                            print(f"  -> 儲存重發回覆訊息失敗: {e}")
+                    else:
+                        print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過")
                     
             else:
                 if not msg.startswith('/'):
@@ -866,8 +1053,14 @@ def validate_channel_name(interface):
         
         for ch in interface.localNode.channels:
             if ch.settings and ch.settings.name == BOARD_MESSAGE_CHANEL_NAME:
+                if ch.index == 0:
+                    channel_validated = False
+                    error_msg = f"Channel '{BOARD_MESSAGE_CHANEL_NAME}' 的 Index 不可以為 0"
+                    print(f"[✗] {error_msg}")
+                    return (False, error_msg)
+                
                 channel_validated = True
-                print(f"[✓] Channel 名稱驗證成功: '{BOARD_MESSAGE_CHANEL_NAME}'")
+                print(f"[✓] Channel 名稱驗證成功: '{BOARD_MESSAGE_CHANEL_NAME}' (Index: {ch.index})")
                 return (True, None)
         
         channel_validated = False
@@ -971,7 +1164,66 @@ def get_user_uuid():
 def get_board_notes(board_id):
     """取得指定 board 的所有 notes，包含 reply_notes 階層結構"""
     is_include_deleted = request.args.get('is_include_deleted', 'false').lower() == 'true'
-    all_notes = get_notes_from_db(board_id, include_deleted=is_include_deleted)
+    
+    # 當 is_include_deleted=False 時，仍需取得所有 notes 以正確處理 reply 關係
+    # 因為 deleted=0 的 reply note 可能指向 deleted=1 的 parent note
+    all_notes_raw = get_notes_from_db(board_id, include_deleted=True)
+    
+    # 如果不顯示已封存，需要進行智慧過濾
+    if not is_include_deleted:
+        # 建立 lora_msg_id 到 note 的映射（用於查找 parent chain）
+        lora_msg_id_to_note = {}
+        for note in all_notes_raw:
+            if note.get('loraMessageId'):
+                lora_msg_id_to_note[note['loraMessageId']] = note
+        
+        # 收集所有 deleted=1 的 lora_msg_id（這些 parent 不應顯示）
+        deleted_lora_msg_ids = set()
+        for note in all_notes_raw:
+            if note.get('archived') and note.get('loraMessageId'):
+                deleted_lora_msg_ids.add(note['loraMessageId'])
+        
+        # 輔助函數：沿著 reply chain 往上找到第一個未刪除的 parent 的 lora_msg_id
+        def find_valid_parent_lora_msg_id(reply_lora_msg_id, visited=None):
+            if visited is None:
+                visited = set()
+            
+            # 防止無限迴圈
+            if reply_lora_msg_id in visited:
+                return None
+            visited.add(reply_lora_msg_id)
+            
+            # 如果指向的 parent 未刪除，直接返回
+            if reply_lora_msg_id not in deleted_lora_msg_ids:
+                return reply_lora_msg_id
+            
+            # 指向的 parent 已刪除，往上找
+            parent_note = lora_msg_id_to_note.get(reply_lora_msg_id)
+            if parent_note and parent_note.get('replyLoraMessageId'):
+                # 繼續往上找
+                return find_valid_parent_lora_msg_id(parent_note['replyLoraMessageId'], visited)
+            
+            # 已刪除的 parent 沒有更上層的 parent，返回 None（成為獨立 note）
+            return None
+        
+        # 過濾 notes：只保留 deleted=0 的
+        # 對於 reply note，如果其 replyLoraMessageId 指向已刪除的 parent，沿 chain 往上找
+        # 如果 root 已刪除（valid_parent 為 None），則整串都不顯示
+        all_notes = []
+        for note in all_notes_raw:
+            if not note.get('archived'):
+                # deleted=0，保留
+                # 檢查其 replyLoraMessageId 是否指向已刪除的 parent
+                if note.get('replyLoraMessageId') in deleted_lora_msg_ids:
+                    # 沿著 reply chain 往上找到第一個未刪除的 parent
+                    valid_parent = find_valid_parent_lora_msg_id(note['replyLoraMessageId'])
+                    if valid_parent is None:
+                        # root 已刪除，整串都不顯示，跳過此 note
+                        continue
+                    note['replyLoraMessageId'] = valid_parent
+                all_notes.append(note)
+    else:
+        all_notes = all_notes_raw
     
     # 建立 lora_msg_id 到 note 的映射
     lora_msg_id_map = {}
@@ -1410,6 +1662,178 @@ def delete_board_note(board_id, note_id):
         
     except Exception as e:
         print(f"刪除 note 失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/boards/<board_id>/notes/<note_id>/resend', methods=['POST'])
+def resend_board_note(board_id, note_id):
+    """重新發送 note (僅限 status 為 LoRa sent 的 note)"""
+    global interface, lora_connected, pending_ack
+    try:
+        data = request.get_json() or {}
+        author_key = data.get('author_key', 'user-unknown')
+        
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT note_id, status, author_key, body, bg_color, lora_msg_id, reply_lora_msg_id, resent_count
+            FROM notes 
+            WHERE note_id = ? AND board_id = ? AND deleted = 0
+        ''', (note_id, board_id))
+        
+        result = cursor.fetchone()
+        if not result:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'Note not found'
+            }), 404
+        
+        status = result['status']
+        db_author_key = result['author_key']
+        body = result['body']
+        bg_color = result['bg_color']
+        lora_msg_id = result['lora_msg_id']
+        reply_lora_msg_id = result['reply_lora_msg_id']
+        resent_count = result['resent_count']
+        
+        if status != 'LoRa sent':
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'Only LoRa sent notes can be resent'
+            }), 403
+        
+        if db_author_key != author_key:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'Not authorized to resend this note'
+            }), 403
+        
+        if not lora_msg_id:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'Note has no lora_msg_id'
+            }), 400
+        
+        if not interface or not lora_connected:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'LoRa not connected'
+            }), 503
+        
+        # 更新 resent_count
+        timestamp = int(time.time() * 1000)
+        cursor.execute('''
+            UPDATE notes 
+            SET resent_count = resent_count + 1, updated_at = ?
+            WHERE note_id = ?
+        ''', (timestamp, note_id))
+        conn.commit()
+        conn.close()
+        
+        # 根據是否為回覆決定使用 /msg 或 /reply 指令
+        try:
+            channel_index = get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME)
+            
+            if reply_lora_msg_id:
+                # 是回覆，使用 /reply 指令
+                msg = f"/reply <{lora_msg_id}>[{reply_lora_msg_id}]{body}"
+                print(f"[重新發送] 使用 /reply 指令: {msg}")
+            else:
+                # 不是回覆，使用 /msg 指令
+                msg = f"/msg [{lora_msg_id}]{body}"
+                print(f"[重新發送] 使用 /msg 指令: {msg}")
+            
+            interface.sendText(msg, channelIndex=channel_index)
+            print(f"  -> 已發送重新發送命令 (note_id={note_id}, resent_count={resent_count + 1})")
+            
+            # 發送 author 命令
+            author_cmd = f"/author [{lora_msg_id}]{db_author_key}"
+            interface.sendText(author_cmd, channelIndex=channel_index)
+            print(f"  -> 已發送 author 命令: {author_cmd}")
+            
+            # 發送 color 命令
+            color_index = get_color_index_from_palette(bg_color)
+            color_cmd = f"/color [{lora_msg_id}]{db_author_key}, {color_index}"
+            interface.sendText(color_cmd, channelIndex=channel_index)
+            print(f"  -> 已發送 color 命令: {color_cmd}")
+            
+            socketio.emit('refresh_notes', {'board_id': board_id})
+            
+            return jsonify({
+                'success': True,
+                'note_id': note_id,
+                'board_id': board_id,
+                'resent_count': resent_count + 1
+            }), 200
+            
+        except Exception as e:
+            print(f"[重新發送] 發送失敗: {e}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({
+                'success': False,
+                'error': f'Failed to send: {str(e)}'
+            }), 500
+        
+    except Exception as e:
+        print(f"重新發送 note 失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/boards/<board_id>/notes/<note_id>/acks', methods=['GET'])
+def get_note_acks(board_id, note_id):
+    """取得指定 note 的 ACK 記錄"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT ack_id, lora_node_id, created_at, updated_at
+            FROM ack_records
+            WHERE note_id = ?
+            ORDER BY created_at DESC
+        ''', (note_id,))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        acks = []
+        for row in rows:
+            lora_node_id = row['lora_node_id']
+            display_id = lora_node_id
+            if lora_node_id.startswith('lora-'):
+                raw_id = lora_node_id.replace('lora-', '')
+                display_id = f"LoRa-{raw_id[-4:]}" if len(raw_id) > 4 else raw_id
+            
+            acks.append({
+                'ackId': row['ack_id'],
+                'loraNodeId': lora_node_id,
+                'displayId': display_id,
+                'createdAt': row['created_at'],
+                'updatedAt': row['updated_at']
+            })
+        
+        return jsonify({
+            'success': True,
+            'note_id': note_id,
+            'acks': acks,
+            'count': len(acks)
+        }), 200
+        
+    except Exception as e:
+        print(f"取得 ACK 記錄失敗: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
