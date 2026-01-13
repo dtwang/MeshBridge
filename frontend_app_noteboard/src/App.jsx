@@ -215,12 +215,25 @@ function App() {
       }
     }
 
+    const handleUsbConnectionError = (data) => {
+      console.error('USB connection error:', data.message)
+      setModalConfig({
+        show: true,
+        type: 'alert',
+        title: '連線錯誤',
+        message: data.message,
+        onConfirm: () => setModalConfig(prev => ({ ...prev, show: false }))
+      })
+    }
+
     socket.on('refresh_notes', handleRefreshNotes)
     socket.on('ack_received', handleAckReceived)
+    socket.on('usb_connection_error', handleUsbConnectionError)
 
     return () => {
       socket.off('refresh_notes', handleRefreshNotes)
       socket.off('ack_received', handleAckReceived)
+      socket.off('usb_connection_error', handleUsbConnectionError)
     }
   }, [socket, showArchived, boardId])
 
@@ -1211,7 +1224,7 @@ function App() {
 
       <footer className="app-footer">
         <div className="footer-left">uid={myUUID}</div>
-        <div className="footer-right">MeshNoteboard v0.2.0</div>
+        <div className="footer-right">MeshNoteboard v0.2.1</div>
       </footer>
 
       {modalConfig.show && (
