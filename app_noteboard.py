@@ -763,7 +763,9 @@ def onReceive(packet, interface):
                         except Exception as e:
                             print(f"  -> 更新 is_temp_parent_note 失敗: {e}")
                 else:
-                    print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過")
+                    print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過建立資料")
+                    print(f"  -> 但仍將在 60 秒後發送 USER ACK 命令")
+                    eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
                     
             elif msg.startswith('/color [') and ']' in msg:
                 end_bracket = msg.index(']')
@@ -1013,9 +1015,18 @@ def send_scheduler_loop():
                     socketio.emit('refresh_notes', {'board_id': BOARD_MESSAGE_CHANEL_NAME})
                     
                 except Exception as e:
+                    error_str = str(e)
                     print(f"[排程器] 發送更新命令失敗: {e}")
                     import traceback
                     traceback.print_exc()
+                    
+                    # 檢測 USB 連線異常
+                    if "Timed out waiting for connection completion" in error_str or \
+                       "device disconnected" in error_str or \
+                       "裝置路徑" in error_str and "已消失" in error_str:
+                        error_msg = "發送失敗：USB連線異常中斷，可能是 Pi 電力供應不足"
+                        print(f"[排程器] {error_msg}")
+                        socketio.emit('usb_connection_error', {'message': error_msg})
                 
                 continue
             
@@ -1060,11 +1071,21 @@ def send_scheduler_loop():
                     print(f"  -> 發送失敗")
                     
             except Exception as e:
+                error_str = str(e)
                 print(f"[排程器] 發送失敗: {e}")
                 import traceback
                 traceback.print_exc()
                 
+                # 檢測 USB 連線異常
+                if "Timed out waiting for connection completion" in error_str or \
+                   "device disconnected" in error_str or \
+                   "裝置路徑" in error_str and "已消失" in error_str:
+                    error_msg = "發送失敗：USB連線異常中斷，可能是 Pi 電力供應不足"
+                    print(f"[排程器] {error_msg}")
+                    socketio.emit('usb_connection_error', {'message': error_msg})
+                
         except Exception as e:
+            error_str = str(e)
             print(f"[排程器] 錯誤: {e}")
             import traceback
             traceback.print_exc()
@@ -1150,6 +1171,7 @@ def mesh_loop():
                     })
 
         except Exception as e:
+            error_str = str(e)
             print(f"Meshtastic 連線異常: {e}")
             if interface:
                 try: interface.close()
@@ -1162,6 +1184,12 @@ def mesh_loop():
                 lora_connected = False
                 channel_validated = False
                 socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None})
+                
+                # 檢測 USB 連線異常，通知前端
+                if "裝置路徑" in error_str and "已消失" in error_str:
+                    error_msg = "發送失敗：USB連線異常中斷，可能是 Pi 電力供應不足"
+                    print(f"[mesh_loop] {error_msg}")
+                    socketio.emit('usb_connection_error', {'message': error_msg})
             
             print("正在重置狀態... (3秒後重試)")
             time.sleep(3)
