@@ -72,6 +72,20 @@ header.header-hidden {
   visibility: visible;
 }
 
+.user-role-container {
+  display: flex;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 5px 10px;
+  border-radius: 15px;
+  margin-left: 8px;
+}
+
+.user-role-label {
+  font-size: 0.75em;
+  color: #ecf0f1;
+}
+
 .status-dot {
   width: 10px;
   height: 10px;
@@ -546,6 +560,13 @@ header.header-hidden {
   transform: scale(0.95);
 }
 
+.ack-counter-wrapper {
+  position: relative;
+  display: inline-block;
+  vertical-align: middle;
+  margin-left: 4px;
+}
+
 .ack-counter {
   background: #1b5e20;
   color: white;
@@ -556,9 +577,26 @@ header.header-hidden {
   cursor: pointer;
   transition: background-color 0.2s;
   user-select: none;
-  margin-left: 4px;
   display: inline-block;
   vertical-align: middle;
+  position: relative;
+  z-index: 1;
+}
+
+.ack-counter-touch-overlay {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 40px;
+  height: 40px;
+  cursor: pointer;
+  z-index: 2;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .ack-counter-touch-overlay {
+    display: none;
+  }
 }
 
 .ack-counter:hover {
@@ -777,6 +815,31 @@ header.header-hidden {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
+.passcode-input-container {
+  margin-bottom: 12px;
+}
+
+.passcode-input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 2px solid rgba(0, 0, 0, 0.2);
+  border-radius: 6px;
+  font-size: 0.95em;
+  box-sizing: border-box;
+  background: rgba(255, 255, 255, 0.6);
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.passcode-input:focus {
+  outline: none;
+  border-color: #2c3e50;
+  background: rgba(255, 255, 255, 0.8);
+}
+
+.passcode-input::placeholder {
+  color: #7f8c8d;
+}
+
 .draft-actions {
   display: flex;
   gap: 10px;
@@ -831,7 +894,8 @@ header.header-hidden {
 
 .btn-edit,
 .btn-delete,
-.btn-color {
+.btn-color,
+.btn-pin {
   background: rgba(44, 62, 80, 0.15);
   border: none;
   border-radius: 50%;
@@ -848,14 +912,16 @@ header.header-hidden {
 
 .btn-edit:hover,
 .btn-delete:hover,
-.btn-color:hover {
+.btn-color:hover,
+.btn-pin:hover {
   background: rgba(44, 62, 80, 0.3);
   transform: scale(1.1);
 }
 
 .btn-edit:active,
 .btn-delete:active,
-.btn-color:active {
+.btn-color:active,
+.btn-pin:active {
   transform: scale(0.95);
 }
 
@@ -875,6 +941,14 @@ header.header-hidden {
   background: rgba(155, 89, 182, 0.3);
 }
 
+.btn-pin {
+  background: rgba(52, 152, 219, 0.15);
+}
+
+.btn-pin:hover {
+  background: rgba(52, 152, 219, 0.3);
+}
+
 /* Modal Styles */
 .modal-overlay {
   position: fixed;
@@ -888,6 +962,10 @@ header.header-hidden {
   justify-content: center;
   z-index: 1000;
   padding: 20px;
+}
+
+.modal-overlay-top {
+  z-index: 1100;
 }
 
 .modal-content {
@@ -925,6 +1003,25 @@ header.header-hidden {
   line-height: 1.6;
   color: #333;
   min-height: 60px;
+}
+
+.modal-body p {
+  margin-bottom: 12px;
+}
+
+.admin-passcode-input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 2px solid #ddd;
+  border-radius: 6px;
+  font-size: 1em;
+  box-sizing: border-box;
+  transition: border-color 0.2s;
+}
+
+.admin-passcode-input:focus {
+  outline: none;
+  border-color: #3498db;
 }
 
 .modal-actions {
@@ -996,6 +1093,15 @@ header.header-hidden {
 
   .status-container {
     padding: 4px 8px;
+  }
+
+  .user-role-container {
+    padding: 4px 8px;
+    margin-left: 6px;
+  }
+
+  .user-role-label {
+    font-size: 0.7em;
   }
 
   .status-text {
@@ -1080,7 +1186,8 @@ header.header-hidden {
   .btn-edit,
   .btn-delete,
   .btn-archive,
-  .btn-color {
+  .btn-color,
+  .btn-pin {
     width: 28px;
     height: 28px;
     font-size: 1em;

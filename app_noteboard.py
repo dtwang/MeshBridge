@@ -9,17 +9,67 @@ import sqlite3
 import uuid
 import re
 import subprocess
+import logging
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, redirect, url_for, jsonify, make_response, session
 from flask_socketio import SocketIO, emit
 from meshtastic.serial_interface import SerialInterface
 from pubsub import pub
-from config import BOARD_MESSAGE_CHANEL_NAME, SEND_INTERVAL_SECOND, ACK_TIMEOUT_SECONDS, MAX_NOTE_SHOW, MAX_ARCHIVED_NOTE_SHOW
+from config import BOARD_MESSAGE_CHANEL_NAME, SEND_INTERVAL_SECOND, ACK_TIMEOUT_SECONDS, MAX_NOTE_SHOW, MAX_ARCHIVED_NOTE_SHOW, NOTEBOARD_ADMIN_PASSCODE
+
+# 抑制 Meshtastic 的 protobuf 解析錯誤日誌（這些是暫時性錯誤，不影響功能）
+logging.getLogger('meshtastic.mesh_interface').setLevel(logging.CRITICAL)
+logging.getLogger('meshtastic.stream_interface').setLevel(logging.CRITICAL)
+
+# Monkey patch Meshtastic 的錯誤處理，抑制 protobuf 解析錯誤
+def patch_meshtastic_error_handling():
+    """修補 Meshtastic 庫的錯誤處理，抑制暫時性的 protobuf 解析錯誤"""
+    try:
+        from meshtastic import mesh_interface
+        import io
+        import contextlib
+        
+        original_handleFromRadio = mesh_interface.MeshInterface._handleFromRadio
+        
+        def patched_handleFromRadio(self, fromRadioBytes):
+            # 使用 context manager 來抑制 stderr 輸出
+            stderr_suppressor = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(stderr_suppressor):
+                    return original_handleFromRadio(self, fromRadioBytes)
+            except Exception as e:
+                error_msg = str(e)
+                # 只抑制 protobuf 解析錯誤，其他錯誤仍然拋出
+                if "Error parsing message" in error_msg or "DecodeError" in error_msg:
+                    # 靜默忽略這些暫時性錯誤（包括 traceback）
+                    pass
+                else:
+                    # 其他錯誤仍然拋出，並顯示 stderr
+                    stderr_content = stderr_suppressor.getvalue()
+                    if stderr_content:
+                        sys.stderr.write(stderr_content)
+                    raise
+        
+        mesh_interface.MeshInterface._handleFromRadio = patched_handleFromRadio
+        print("[系統] 已修補 Meshtastic protobuf 錯誤處理")
+    except Exception as e:
+        print(f"[系統] 修補 Meshtastic 錯誤處理失敗 (可忽略): {e}")
+
+# 在導入 SerialInterface 之後立即執行修補
+patch_meshtastic_error_handling()
+
+try:
+    from config import NOTEBOARD_POST_PASSCODE
+except ImportError:
+    NOTEBOARD_POST_PASSCODE = ""
 
 try:
     from config import UID_SOURCE
 except ImportError:
     UID_SOURCE = "mac"
+
+# 控制是否印出完整 LoRa 封包資訊
+IS_PRINT_LORA_PACKAGE = False
 
 # 驗證 BOARD_MESSAGE_CHANEL_NAME 設定
 FORBIDDEN_CHANNEL_NAMES = ["MeshTW", "Emergency!"]
@@ -48,6 +98,8 @@ send_interval = max(SEND_INTERVAL_SECOND, 10)
 
 DB_PATH = 'noteboard.db'
 MAX_NOTES = 200
+
+admin_users = set()
 
 COLOR_PALETTE = [
     'hsl(0, 70%, 85%)',      # 0: Red
@@ -366,13 +418,13 @@ def archive_note(note_id, author_key, need_lora_update=False):
         if need_lora_update:
             cursor.execute('''
                 UPDATE notes 
-                SET deleted = 1, updated_at = ?, is_need_update_lora = 1
+                SET deleted = 1, is_pined_note = 0, updated_at = ?, is_need_update_lora = 1
                 WHERE note_id = ? AND author_key = ?
             ''', (timestamp, note_id, author_key))
         else:
             cursor.execute('''
                 UPDATE notes 
-                SET deleted = 1, updated_at = ?
+                SET deleted = 1, is_pined_note = 0, updated_at = ?
                 WHERE note_id = ? AND author_key = ?
             ''', (timestamp, note_id, author_key))
         
@@ -393,7 +445,7 @@ def archive_note_by_lora_msg_id(lora_msg_id, author_key):
         
         cursor.execute('''
             UPDATE notes 
-            SET deleted = 1, updated_at = ?
+            SET deleted = 1, is_pined_note = 0, updated_at = ?
             WHERE lora_msg_id = ? AND author_key = ?
         ''', (timestamp, lora_msg_id, author_key))
         
@@ -403,6 +455,65 @@ def archive_note_by_lora_msg_id(lora_msg_id, author_key):
         return affected_rows > 0
     except Exception as e:
         print(f"封存 note 失敗: {e}")
+        return False
+
+def pin_note_by_lora_msg_id(lora_msg_id, author_key):
+    """透過 lora_msg_id 將 note 標記為置頂 (is_pined_note=1)，需驗證 author_key 和 lora_msg_id 存在"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        timestamp = int(time.time() * 1000)
+        
+        cursor.execute('''
+            SELECT board_id, reply_lora_msg_id, is_temp_parent_note, deleted
+            FROM notes 
+            WHERE lora_msg_id = ? AND author_key = ?
+        ''', (lora_msg_id, author_key))
+        
+        result = cursor.fetchone()
+        if not result:
+            conn.close()
+            return False
+        
+        board_id = result['board_id']
+        reply_lora_msg_id = result['reply_lora_msg_id']
+        is_temp_parent_note = result['is_temp_parent_note']
+        deleted = result['deleted']
+        
+        if reply_lora_msg_id is not None and reply_lora_msg_id != '':
+            print(f"  -> 無法置頂回覆訊息")
+            conn.close()
+            return False
+        
+        if is_temp_parent_note == 1:
+            print(f"  -> 無法置頂臨時父訊息")
+            conn.close()
+            return False
+        
+        if deleted == 1:
+            print(f"  -> 無法置頂已封存的訊息")
+            conn.close()
+            return False
+        
+        cursor.execute('''
+            UPDATE notes 
+            SET is_pined_note = 0, updated_at = ?
+            WHERE board_id = ? AND is_pined_note = 1
+        ''', (timestamp, board_id))
+        
+        cursor.execute('''
+            UPDATE notes 
+            SET is_pined_note = 1, updated_at = ?
+            WHERE lora_msg_id = ? AND author_key = ?
+        ''', (timestamp, lora_msg_id, author_key))
+        
+        affected_rows = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return affected_rows > 0
+    except Exception as e:
+        print(f"置頂 note 失敗: {e}")
         return False
 
 def save_lora_note(lora_msg_id, board_id, body, bg_color='', author_key='', reply_lora_msg_id=None):
@@ -557,7 +668,7 @@ def get_notes_from_db(board_id, include_deleted=False):
         if include_deleted:
             cursor.execute('''
                 SELECT note_id, reply_lora_msg_id, body, bg_color, status, 
-                       created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note
+                       created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, is_pined_note
                 FROM notes 
                 WHERE board_id = ?
                 ORDER BY created_at DESC
@@ -566,7 +677,7 @@ def get_notes_from_db(board_id, include_deleted=False):
         else:
             cursor.execute('''
                 SELECT note_id, reply_lora_msg_id, body, bg_color, status, 
-                       created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note
+                       created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, is_pined_note
                 FROM notes 
                 WHERE board_id = ? AND deleted = 0
                 ORDER BY created_at DESC
@@ -599,7 +710,8 @@ def get_notes_from_db(board_id, include_deleted=False):
                 'rev': row['rev'],
                 'archived': row['deleted'] == 1,
                 'loraMessageId': row['lora_msg_id'],
-                'isTempParentNote': row['is_temp_parent_note'] == 1
+                'isTempParentNote': row['is_temp_parent_note'] == 1,
+                'isPinedNote': row['is_pined_note'] == 1
             })
         
         conn.close()
@@ -639,14 +751,33 @@ def get_color_index_from_palette(bg_color):
     except Exception as e:
         return 0
 
-def send_ack_delayed(lora_msg_id, interface_obj, channel_name):
-    """延遲發送 USER ACK 命令"""
+def send_ack_delayed(lora_msg_id, interface_obj, channel_name, retry_count=0, max_retries=3):
+    """延遲發送 USER ACK 命令（含重試機制）"""
     try:
+        if not interface_obj:
+            print(f"  -> [延遲 60 秒後] Interface 物件為 None，無法發送 ACK")
+            return
+        
+        if not hasattr(interface_obj, 'localNode') or not interface_obj.localNode:
+            print(f"  -> [延遲 60 秒後] Interface 未連接到本地節點，無法發送 ACK")
+            return
+        
+        if not lora_connected:
+            print(f"  -> [延遲 60 秒後] LoRa 設備未連接，無法發送 ACK")
+            return
+        
         ack_cmd = f"/ack {lora_msg_id}"
         interface_obj.sendText(ack_cmd, channelIndex=get_channel_index(interface_obj, channel_name))
         print(f"  -> [延遲 60 秒後] 已發送 USER ACK 命令: {ack_cmd}")
     except Exception as e:
-        print(f"  -> [延遲 60 秒後] 發送 USER ACK 命令失敗: {e}")
+        print(f"  -> [延遲 60 秒後] 發送 USER ACK 命令失敗 (嘗試 {retry_count + 1}/{max_retries + 1}): {e}")
+        
+        if retry_count < max_retries:
+            retry_delay = 10
+            print(f"  -> 將在 {retry_delay} 秒後重試...")
+            eventlet.spawn_after(retry_delay, send_ack_delayed, lora_msg_id, interface_obj, channel_name, retry_count + 1, max_retries)
+        else:
+            print(f"  -> 已達最大重試次數，放棄發送 ACK 命令")
 
 def onReceive(packet, interface):
     global pending_ack
@@ -666,14 +797,28 @@ def onReceive(packet, interface):
                         update_note_lora_msg_id(note_info['note_id'], lora_msg_id)
                         print(f"  -> 已儲存 lora_msg_id: {lora_msg_id} (使用 request_id)")
                         
-                        author_cmd = f"/author [{lora_msg_id}]{note_info['author_key']}"
-                        interface.sendText(author_cmd, channelIndex=get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME))
-                        print(f"  -> 已發送 author 命令: {author_cmd}")
+                        def send_author_and_color():
+                            try:
+                                author_cmd = f"/author [{lora_msg_id}]{note_info['author_key']}"
+                                interface.sendText(author_cmd, channelIndex=get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME))
+                                print(f"  -> [延遲 5 秒後] 已發送 author 命令: {author_cmd}")
+                                
+                                def send_color():
+                                    try:
+                                        color_index = get_color_index_from_palette(note_info['bg_color'])
+                                        color_cmd = f"/color [{lora_msg_id}]{note_info['author_key']}, {color_index}"
+                                        interface.sendText(color_cmd, channelIndex=get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME))
+                                        print(f"  -> [延遲 10 秒後] 已發送 color 命令: {color_cmd}")
+                                    except Exception as e:
+                                        print(f"  -> [延遲 10 秒後] 發送 color 命令失敗: {e}")
+                                
+                                eventlet.spawn_after(5, send_color)
+                                print(f"  -> 已排程在 5 秒後發送 color 命令")
+                            except Exception as e:
+                                print(f"  -> [延遲 5 秒後] 發送 author 命令失敗: {e}")
                         
-                        color_index = get_color_index_from_palette(note_info['bg_color'])
-                        color_cmd = f"/color [{lora_msg_id}]{note_info['author_key']}, {color_index}"
-                        interface.sendText(color_cmd, channelIndex=get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME))
-                        print(f"  -> 已發送 color 命令: {color_cmd}")
+                        eventlet.spawn_after(5, send_author_and_color)
+                        print(f"  -> 已排程在 5 秒後發送 author 和 color 命令")
                     except Exception as e:
                         print(f"  -> 發送後續命令失敗: {e}")
                     
@@ -692,26 +837,27 @@ def onReceive(packet, interface):
             channel_name = get_channel_name(interface, channel_index) if channel_index != 'N/A' else 'N/A'
             
             if channel_name != BOARD_MESSAGE_CHANEL_NAME:
-                print(f"[略過] Channel '{channel_name}' 不符合目標 '{BOARD_MESSAGE_CHANEL_NAME}'")
+                # print(f"[略過] Channel '{channel_name}' 不符合目標 '{BOARD_MESSAGE_CHANEL_NAME}'")
                 return
 
-            print(f"[收到 LoRa] 完整封包資訊:")
-            print(f"  - 發送者 ID: {raw_id}")
-            print(f"  - 顯示名稱: {sender_display}")
-            print(f"  - 訊息內容: {msg}")
-            print(f"  - 訊息 ID: {lora_msg_id}")
-            print(f"  - 時間戳記: {packet.get('rxTime', packet.get('timestamp', 'N/A'))}")
-            print(f"  - 接收 SNR: {packet.get('rxSnr', 'N/A')}")
-            print(f"  - 接收 RSSI: {packet.get('rxRssi', 'N/A')}")
-            print(f"  - Hop Limit: {packet.get('hopLimit', 'N/A')}")
-            print(f"  - 目標 ID: {packet.get('toId', 'N/A')}")
-            print(f"  - Channel Index: {channel_index}")
-            print(f"  - Channel Name: {channel_name}")
-            if 'decoded' in packet:
-                print(f"  - Port Number: {packet['decoded'].get('portnum', 'N/A')}")
-                print(f"  - 請求 ID: {packet['decoded'].get('requestId', 'N/A')}")
-            print(f"  - 原始封包: {packet}")
-            print("-" * 60)
+            if IS_PRINT_LORA_PACKAGE:
+                print(f"[收到 LoRa] 完整封包資訊:")
+                print(f"  - 發送者 ID: {raw_id}")
+                print(f"  - 顯示名稱: {sender_display}")
+                print(f"  - 訊息內容: {msg}")
+                print(f"  - 訊息 ID: {lora_msg_id}")
+                print(f"  - 時間戳記: {packet.get('rxTime', packet.get('timestamp', 'N/A'))}")
+                print(f"  - 接收 SNR: {packet.get('rxSnr', 'N/A')}")
+                print(f"  - 接收 RSSI: {packet.get('rxRssi', 'N/A')}")
+                print(f"  - Hop Limit: {packet.get('hopLimit', 'N/A')}")
+                print(f"  - 目標 ID: {packet.get('toId', 'N/A')}")
+                print(f"  - Channel Index: {channel_index}")
+                print(f"  - Channel Name: {channel_name}")
+                if 'decoded' in packet:
+                    print(f"  - Port Number: {packet['decoded'].get('portnum', 'N/A')}")
+                    print(f"  - 請求 ID: {packet['decoded'].get('requestId', 'N/A')}")
+                print(f"  - 原始封包: {packet}")
+                print("-" * 60)
             
             should_refresh = False
             
@@ -809,6 +955,18 @@ def onReceive(packet, interface):
                     should_refresh = True
                 else:
                     print(f"  -> 封存失敗，lora_msg_id {lora_msg_id} 不存在或 author_key 不符")
+                    
+            elif msg.startswith('/pin [') and ']' in msg:
+                end_bracket = msg.index(']')
+                lora_msg_id = msg[6:end_bracket]
+                author_key = msg[end_bracket + 1:].strip()
+                print(f"[置頂訊息] lora_msg_id={lora_msg_id}, author_key={author_key}")
+                
+                if pin_note_by_lora_msg_id(lora_msg_id, author_key):
+                    print(f"  -> 成功置頂 note (lora_msg_id={lora_msg_id})")
+                    should_refresh = True
+                else:
+                    print(f"  -> 置頂失敗，lora_msg_id {lora_msg_id} 不存在或 author_key 不符")
                     
             elif msg.startswith('/ack '):
                 ack_lora_msg_id = msg[5:].strip()
@@ -927,7 +1085,9 @@ def onReceive(packet, interface):
                         except Exception as e:
                             print(f"  -> 儲存重發回覆訊息失敗: {e}")
                     else:
-                        print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過")
+                        print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過建立資料")
+                        print(f"  -> 但仍將在 60 秒後發送 USER ACK 命令")
+                        eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
                     
             else:
                 if not msg.startswith('/'):
@@ -1024,7 +1184,7 @@ def send_scheduler_loop():
                     if "Timed out waiting for connection completion" in error_str or \
                        "device disconnected" in error_str or \
                        "裝置路徑" in error_str and "已消失" in error_str:
-                        error_msg = "發送失敗：USB連線異常中斷，可能是 Pi 電力供應不足"
+                        error_msg = "發送失敗：USB連線異常中斷，可能是 Pi 電力供應不足、更換線材、或 Mesh 裝置需要重啟"
                         print(f"[排程器] {error_msg}")
                         socketio.emit('usb_connection_error', {'message': error_msg})
                 
@@ -1080,7 +1240,7 @@ def send_scheduler_loop():
                 if "Timed out waiting for connection completion" in error_str or \
                    "device disconnected" in error_str or \
                    "裝置路徑" in error_str and "已消失" in error_str:
-                    error_msg = "發送失敗：USB連線異常中斷，可能是 Pi 電力供應不足"
+                    error_msg = "發送失敗：USB連線異常中斷，可能是 Pi 電力供應不足、更換線材、或 Mesh 裝置需要重啟"
                     print(f"[排程器] {error_msg}")
                     socketio.emit('usb_connection_error', {'message': error_msg})
                 
@@ -1138,11 +1298,66 @@ def mesh_loop():
                 target_port = scan_for_meshtastic()
                 if target_port:
                     print(f"發現裝置於: {target_port}，嘗試連線...")
-                    interface = SerialInterface(devPath=target_port)
-                    current_dev_path = target_port
-                    pub.subscribe(onReceive, "meshtastic.receive")
                     
-                    print(f">>> 成功連線至 {target_port} <<<")
+                    # 嘗試連線，最多重試 3 次
+                    max_retries = 3
+                    retry_delay = 2
+                    connection_success = False
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            if attempt > 0:
+                                print(f"  -> 重試連線 (嘗試 {attempt + 1}/{max_retries})...")
+                                time.sleep(retry_delay * attempt)
+                            
+                            # 清空可能的殘留資料
+                            try:
+                                import serial
+                                # 使用 exclusive=False 避免鎖定問題
+                                temp_serial = serial.Serial(target_port, 115200, timeout=1, exclusive=False)
+                                temp_serial.reset_input_buffer()
+                                temp_serial.reset_output_buffer()
+                                temp_serial.close()
+                                time.sleep(2)
+                                print(f"  -> 已清空 serial buffer，等待設備穩定...")
+                            except Exception as e:
+                                print(f"  -> 清空 buffer 失敗: {e}")
+                                # 如果是鎖定問題，等待一下再繼續
+                                if "lock" in str(e).lower() or "Resource temporarily unavailable" in str(e):
+                                    print(f"  -> 偵測到 port 鎖定問題，等待 3 秒後繼續...")
+                                    time.sleep(3)
+                            
+                            # 初始化 SerialInterface
+                            interface = SerialInterface(devPath=target_port)
+                            current_dev_path = target_port
+                            pub.subscribe(onReceive, "meshtastic.receive")
+                            
+                            print(f">>> 成功連線至 {target_port} <<<")
+                            connection_success = True
+                            break
+                            
+                        except Exception as conn_error:
+                            error_msg = str(conn_error)
+                            print(f"  -> 連線失敗 (嘗試 {attempt + 1}/{max_retries}): {error_msg}")
+                            
+                            # 如果是 protobuf 解析錯誤，可能只是暫時性問題，繼續重試
+                            if "Error parsing message" in error_msg or "DecodeError" in error_msg:
+                                print(f"  -> 偵測到 protobuf 解析錯誤，將重試...")
+                                if interface:
+                                    try:
+                                        interface.close()
+                                    except:
+                                        pass
+                                    interface = None
+                                continue
+                            else:
+                                # 其他錯誤直接拋出
+                                raise
+                    
+                    if not connection_success:
+                        print(f"  -> 連線失敗，已達最大重試次數")
+                        time.sleep(3)
+                        continue
                     
                     eventlet.sleep(2)
                     
@@ -1187,7 +1402,7 @@ def mesh_loop():
                 
                 # 檢測 USB 連線異常，通知前端
                 if "裝置路徑" in error_str and "已消失" in error_str:
-                    error_msg = "發送失敗：USB連線異常中斷，可能是 Pi 電力供應不足"
+                    error_msg = "發送失敗：USB連線異常中斷，可能是 Pi 電力供應不足、更換線材、或 Mesh 裝置需要重啟"
                     print(f"[mesh_loop] {error_msg}")
                     socketio.emit('usb_connection_error', {'message': error_msg})
             
@@ -1202,6 +1417,14 @@ def get_channel_name_config():
     return jsonify({
         'success': True,
         'channel_name': BOARD_MESSAGE_CHANEL_NAME
+    })
+
+@app.route('/api/config/post_passcode_required', methods=['GET'])
+def get_post_passcode_required():
+    """檢查是否需要張貼通關碼"""
+    return jsonify({
+        'success': True,
+        'required': bool(NOTEBOARD_POST_PASSCODE and NOTEBOARD_POST_PASSCODE.strip())
     })
 
 @app.route('/api/user/uuid', methods=['GET'])
@@ -1228,6 +1451,95 @@ def get_user_uuid():
             'success': True,
             'uuid': user_uuid
         })
+
+@app.route('/api/user/admin/status', methods=['GET'])
+def get_admin_status():
+    """檢查當前用戶是否為管理者"""
+    try:
+        if UID_SOURCE == "mac":
+            client_ip = request.remote_addr
+            mac_address = mac_from_ip(client_ip)
+            user_uuid = mac_address if mac_address else get_or_create_user_uuid()
+        else:
+            user_uuid = get_or_create_user_uuid()
+        
+        is_admin = user_uuid in admin_users
+        return jsonify({
+            'success': True,
+            'is_admin': is_admin
+        })
+    except Exception as e:
+        print(f"檢查管理者狀態失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/user/admin/authenticate', methods=['POST'])
+def authenticate_admin():
+    """驗證管理者 passcode"""
+    try:
+        data = request.get_json()
+        passcode = data.get('passcode', '')
+        
+        if not passcode:
+            return jsonify({
+                'success': False,
+                'error': 'Passcode is required'
+            }), 400
+        
+        if passcode != NOTEBOARD_ADMIN_PASSCODE:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid passcode'
+            }), 401
+        
+        if UID_SOURCE == "mac":
+            client_ip = request.remote_addr
+            mac_address = mac_from_ip(client_ip)
+            user_uuid = mac_address if mac_address else get_or_create_user_uuid()
+        else:
+            user_uuid = get_or_create_user_uuid()
+        
+        admin_users.add(user_uuid)
+        print(f"用戶 {user_uuid} 已認證為管理者")
+        
+        return jsonify({
+            'success': True,
+            'is_admin': True
+        })
+    except Exception as e:
+        print(f"管理者認證失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/user/admin/logout', methods=['POST'])
+def logout_admin():
+    """登出管理者身份"""
+    try:
+        if UID_SOURCE == "mac":
+            client_ip = request.remote_addr
+            mac_address = mac_from_ip(client_ip)
+            user_uuid = mac_address if mac_address else get_or_create_user_uuid()
+        else:
+            user_uuid = get_or_create_user_uuid()
+        
+        if user_uuid in admin_users:
+            admin_users.remove(user_uuid)
+            print(f"用戶 {user_uuid} 已登出管理者身份")
+        
+        return jsonify({
+            'success': True,
+            'is_admin': False
+        })
+    except Exception as e:
+        print(f"管理者登出失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/boards/<board_id>/notes', methods=['GET'])
 def get_board_notes(board_id):
@@ -1358,6 +1670,9 @@ def get_board_notes(board_id):
         
         parent['replyNotes'] = replies
     
+    # 將置頂的 note 排到最前面
+    parent_notes.sort(key=lambda x: (not x.get('isPinedNote', False), -x.get('timestamp', 0)))
+    
     return jsonify({
         'success': True,
         'board_id': board_id,
@@ -1374,12 +1689,30 @@ def create_board_note(board_id):
         author_key = data.get('author_key', 'user-unknown')
         color_index = data.get('color_index', 0)
         parent_note_id = data.get('parent_note_id', None)
+        post_passcode = data.get('post_passcode', '')
         
         if not text:
             return jsonify({
                 'success': False,
                 'error': 'Text is required'
             }), 400
+        
+        # 檢查是否需要驗證張貼通關碼（非管理者時）
+        if UID_SOURCE == "mac":
+            client_ip = request.remote_addr
+            mac_address = mac_from_ip(client_ip)
+            user_uuid = mac_address if mac_address else get_or_create_user_uuid()
+        else:
+            user_uuid = get_or_create_user_uuid()
+        
+        is_admin = user_uuid in admin_users
+        
+        if not is_admin and NOTEBOARD_POST_PASSCODE and NOTEBOARD_POST_PASSCODE.strip():
+            if post_passcode != NOTEBOARD_POST_PASSCODE:
+                return jsonify({
+                    'success': False,
+                    'error': '發送用通關碼錯誤'
+                }), 403
         
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -1550,10 +1883,22 @@ def update_board_note(board_id, note_id):
 
 @app.route('/api/boards/<board_id>/notes/<note_id>/archive', methods=['POST'])
 def archive_board_note(board_id, note_id):
-    """封存 note (僅限 author 本人且 status 非 LAN only)"""
+    """封存 note (僅限 author 本人或管理者，且 status 非 LAN only)"""
     try:
         data = request.get_json() or {}
         author_key = data.get('author_key', 'user-unknown')
+        is_admin_request = data.get('is_admin', False)
+        
+        # 取得當前使用者的 UUID
+        if UID_SOURCE == "mac":
+            client_ip = request.remote_addr
+            mac_address = mac_from_ip(client_ip)
+            current_user_uuid = mac_address if mac_address else get_or_create_user_uuid()
+        else:
+            current_user_uuid = get_or_create_user_uuid()
+        
+        # 驗證管理者身份
+        is_verified_admin = is_admin_request and (current_user_uuid in admin_users)
         
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -1580,8 +1925,14 @@ def archive_board_note(board_id, note_id):
                 'error': 'LAN only notes cannot be archived via this endpoint'
             }), 403
         
-        if db_author_key != author_key:
+        # 權限檢查：
+        # 1. 一般使用者：當前使用者 UUID 必須與資料庫中的 author_key 相符
+        # 2. 管理者：已驗證為管理者即可封存任何便利貼
+        is_own_note = (current_user_uuid == db_author_key)
+        
+        if not is_own_note and not is_verified_admin:
             conn.close()
+            print(f"封存權限檢查失敗: current_user={current_user_uuid}, db_author={db_author_key}, is_admin={is_verified_admin}")
             return jsonify({
                 'success': False,
                 'error': 'Not authorized to archive this note'
@@ -1589,7 +1940,7 @@ def archive_board_note(board_id, note_id):
         
         conn.close()
         
-        if archive_note(note_id, author_key, need_lora_update=True):
+        if archive_note(note_id, db_author_key, need_lora_update=True):
             socketio.emit('refresh_notes', {'board_id': board_id})
             return jsonify({
                 'success': True,
@@ -1611,11 +1962,22 @@ def archive_board_note(board_id, note_id):
 
 @app.route('/api/boards/<board_id>/notes/<note_id>/color', methods=['POST'])
 def change_note_color(board_id, note_id):
-    """變更 note 顏色 (僅限 author 本人且 status 非 LAN only)"""
+    """變更 note 顏色 (僅限 author 本人或管理者，且 status 非 LAN only)"""
     try:
         data = request.get_json() or {}
         author_key = data.get('author_key', 'user-unknown')
         color_index = data.get('color_index', 0)
+        is_admin_action = data.get('is_admin', False)
+        
+        # 檢查是否為管理者
+        if UID_SOURCE == "mac":
+            client_ip = request.remote_addr
+            mac_address = mac_from_ip(client_ip)
+            user_uuid = mac_address if mac_address else get_or_create_user_uuid()
+        else:
+            user_uuid = get_or_create_user_uuid()
+        
+        is_admin_user = user_uuid in admin_users
         
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -1642,16 +2004,21 @@ def change_note_color(board_id, note_id):
                 'error': 'LAN only notes cannot change color via this endpoint'
             }), 403
         
-        if db_author_key != author_key:
+        # 管理者可以變更任何人的 note 顏色
+        if is_admin_action and is_admin_user:
+            effective_author_key = db_author_key
+        elif db_author_key != author_key:
             conn.close()
             return jsonify({
                 'success': False,
                 'error': 'Not authorized to change color of this note'
             }), 403
+        else:
+            effective_author_key = author_key
         
         conn.close()
         
-        if update_note_color_by_note_id(note_id, author_key, color_index, need_lora_update=True):
+        if update_note_color_by_note_id(note_id, effective_author_key, color_index, need_lora_update=True):
             socketio.emit('refresh_notes', {'board_id': board_id})
             return jsonify({
                 'success': True,
@@ -1666,6 +2033,109 @@ def change_note_color(board_id, note_id):
         
     except Exception as e:
         print(f"變更 note 顏色失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/boards/<board_id>/notes/<note_id>/pin', methods=['POST'])
+def pin_board_note(board_id, note_id):
+    """置頂 note (僅限管理者)"""
+    global interface, lora_connected
+    try:
+        if UID_SOURCE == "mac":
+            client_ip = request.remote_addr
+            mac_address = mac_from_ip(client_ip)
+            user_uuid = mac_address if mac_address else get_or_create_user_uuid()
+        else:
+            user_uuid = get_or_create_user_uuid()
+        
+        if user_uuid not in admin_users:
+            return jsonify({
+                'success': False,
+                'error': 'Not authorized - admin only'
+            }), 403
+        
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT note_id, reply_lora_msg_id, is_temp_parent_note, deleted, author_key, lora_msg_id
+            FROM notes 
+            WHERE note_id = ? AND board_id = ?
+        ''', (note_id, board_id))
+        
+        result = cursor.fetchone()
+        if not result:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'Note not found'
+            }), 404
+        
+        reply_lora_msg_id = result['reply_lora_msg_id']
+        is_temp_parent_note = result['is_temp_parent_note']
+        deleted = result['deleted']
+        author_key = result['author_key']
+        lora_msg_id = result['lora_msg_id']
+        
+        if reply_lora_msg_id is not None and reply_lora_msg_id != '':
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'Cannot pin reply notes'
+            }), 403
+        
+        if is_temp_parent_note == 1:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'Cannot pin temporary parent notes'
+            }), 403
+        
+        if deleted == 1:
+            conn.close()
+            return jsonify({
+                'success': False,
+                'error': 'Cannot pin archived notes'
+            }), 403
+        
+        timestamp = int(time.time() * 1000)
+        
+        cursor.execute('''
+            UPDATE notes 
+            SET is_pined_note = 0, updated_at = ?
+            WHERE board_id = ? AND is_pined_note = 1
+        ''', (timestamp, board_id))
+        
+        cursor.execute('''
+            UPDATE notes 
+            SET is_pined_note = 1, updated_at = ?
+            WHERE note_id = ? AND board_id = ?
+        ''', (timestamp, note_id, board_id))
+        
+        conn.commit()
+        conn.close()
+        
+        if interface and lora_connected:
+            try:
+                pin_cmd = f"/pin [{lora_msg_id}]{author_key}"
+                interface.sendText(pin_cmd, channelIndex=get_channel_index(interface, board_id))
+                print(f"已發送置頂命令: {pin_cmd}")
+            except Exception as e:
+                print(f"發送置頂命令失敗: {e}")
+        
+        socketio.emit('refresh_notes', {'board_id': board_id})
+        
+        return jsonify({
+            'success': True,
+            'note_id': note_id,
+            'board_id': board_id
+        }), 200
+        
+    except Exception as e:
+        print(f"置頂 note 失敗: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -1743,13 +2213,29 @@ def resend_board_note(board_id, note_id):
     try:
         data = request.get_json() or {}
         author_key = data.get('author_key', 'user-unknown')
+        is_admin = data.get('is_admin', False)
+        
+        # 驗證管理者身份
+        if is_admin:
+            if UID_SOURCE == "mac":
+                client_ip = request.remote_addr
+                mac_address = mac_from_ip(client_ip)
+                user_uuid = mac_address if mac_address else get_or_create_user_uuid()
+            else:
+                user_uuid = get_or_create_user_uuid()
+            
+            if user_uuid not in admin_users:
+                return jsonify({
+                    'success': False,
+                    'error': 'Not authorized as admin'
+                }), 403
         
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT note_id, status, author_key, body, bg_color, lora_msg_id, reply_lora_msg_id, resent_count
+            SELECT note_id, status, author_key, body, bg_color, lora_msg_id, reply_lora_msg_id, resent_count, is_pined_note
             FROM notes 
             WHERE note_id = ? AND board_id = ? AND deleted = 0
         ''', (note_id, board_id))
@@ -1769,6 +2255,7 @@ def resend_board_note(board_id, note_id):
         lora_msg_id = result['lora_msg_id']
         reply_lora_msg_id = result['reply_lora_msg_id']
         resent_count = result['resent_count']
+        is_pined_note = result['is_pined_note']
         
         if status != 'LoRa sent':
             conn.close()
@@ -1777,7 +2264,8 @@ def resend_board_note(board_id, note_id):
                 'error': 'Only LoRa sent notes can be resent'
             }), 403
         
-        if db_author_key != author_key:
+        # 如果不是管理者，則檢查是否為作者本人
+        if not is_admin and db_author_key != author_key:
             conn.close()
             return jsonify({
                 'success': False,
@@ -1824,16 +2312,30 @@ def resend_board_note(board_id, note_id):
             interface.sendText(msg, channelIndex=channel_index)
             print(f"  -> 已發送重新發送命令 (note_id={note_id}, resent_count={resent_count + 1})")
             
-            # 發送 author 命令
-            author_cmd = f"/author [{lora_msg_id}]{db_author_key}"
-            interface.sendText(author_cmd, channelIndex=channel_index)
-            print(f"  -> 已發送 author 命令: {author_cmd}")
+            # 延遲 5 秒後發送 author、color 和 pin 命令
+            def send_follow_up_commands():
+                try:
+                    # 發送 author 命令
+                    author_cmd = f"/author [{lora_msg_id}]{db_author_key}"
+                    interface.sendText(author_cmd, channelIndex=channel_index)
+                    print(f"  -> [延遲 5 秒後] 已發送 author 命令: {author_cmd}")
+                    
+                    # 發送 color 命令
+                    color_index = get_color_index_from_palette(bg_color)
+                    color_cmd = f"/color [{lora_msg_id}]{db_author_key}, {color_index}"
+                    interface.sendText(color_cmd, channelIndex=channel_index)
+                    print(f"  -> [延遲 5 秒後] 已發送 color 命令: {color_cmd}")
+                    
+                    # 如果該 note 有 is_pined_note = true，也發送 /pin 命令
+                    if is_pined_note == 1:
+                        pin_cmd = f"/pin [{lora_msg_id}]{db_author_key}"
+                        interface.sendText(pin_cmd, channelIndex=channel_index)
+                        print(f"  -> [延遲 5 秒後] 已發送 pin 命令: {pin_cmd}")
+                except Exception as e:
+                    print(f"  -> [延遲 5 秒後] 發送後續命令失敗: {e}")
             
-            # 發送 color 命令
-            color_index = get_color_index_from_palette(bg_color)
-            color_cmd = f"/color [{lora_msg_id}]{db_author_key}, {color_index}"
-            interface.sendText(color_cmd, channelIndex=channel_index)
-            print(f"  -> 已發送 color 命令: {color_cmd}")
+            eventlet.spawn_after(5, send_follow_up_commands)
+            print(f"  -> 已排程在 5 秒後發送 author、color 和 pin 命令")
             
             socketio.emit('refresh_notes', {'board_id': board_id})
             
