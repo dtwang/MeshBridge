@@ -89,6 +89,13 @@ function App() {
   const [ackTooltipPosition, setAckTooltipPosition] = useState({ top: 0, left: 0 })
   const ackTooltipRef = useRef(null)
   const ackCounterRefs = useRef({})
+  const touchStartPos = useRef({ x: 0, y: 0 })
+  const [isAdmin, setIsAdmin] = useState(false)
+  const [showAdminModal, setShowAdminModal] = useState(false)
+  const [adminPasscode, setAdminPasscode] = useState('')
+  const [postPasscodeRequired, setPostPasscodeRequired] = useState(false)
+  const [draftPostPasscode, setDraftPostPasscode] = useState('')
+  const [replyPostPasscode, setReplyPostPasscode] = useState('')
 
   const fetchNotes = async (includeDeleted = false, targetBoardId = null) => {
     try {
@@ -173,6 +180,26 @@ function App() {
         console.error('Failed to fetch UUID from backend:', error)
         const fallbackUuid = randomCode8()
         setMyUUID(fallbackUuid)
+      }
+
+      try {
+        const adminResponse = await fetch('/api/user/admin/status')
+        const adminData = await adminResponse.json()
+        if (adminData.success) {
+          setIsAdmin(adminData.is_admin)
+        }
+      } catch (error) {
+        console.error('Failed to fetch admin status:', error)
+      }
+
+      try {
+        const passcodeResponse = await fetch('/api/config/post_passcode_required')
+        const passcodeData = await passcodeResponse.json()
+        if (passcodeData.success) {
+          setPostPasscodeRequired(passcodeData.required)
+        }
+      } catch (error) {
+        console.error('Failed to fetch post passcode config:', error)
       }
 
       const newSocket = io()
@@ -405,6 +432,104 @@ function App() {
     })
   }
 
+  const handleUserRoleClick = async () => {
+    if (!isAdmin) {
+      setShowAdminModal(true)
+      setAdminPasscode('')
+    } else {
+      const confirmed = await showConfirm('確定要登出管理者身份，切換為一般使用者嗎？', '登出管理者')
+      if (confirmed) {
+        handleAdminLogout()
+      }
+    }
+  }
+
+  const handleAdminAuthenticate = async () => {
+    if (!adminPasscode.trim()) {
+      showAlert('請輸入管理者密碼！')
+      return
+    }
+
+    try {
+      const response = await fetch('/api/user/admin/authenticate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          passcode: adminPasscode
+        })
+      })
+
+      const data = await response.json()
+      if (data.success && data.is_admin) {
+        setIsAdmin(true)
+        setShowAdminModal(false)
+        setAdminPasscode('')
+        showAlert('已切換至管理者身份', '成功')
+      } else {
+        showAlert('密碼錯誤，請重新輸入', '錯誤')
+        setAdminPasscode('')
+      }
+    } catch (error) {
+      console.error('Failed to authenticate admin:', error)
+      showAlert('認證失敗：' + error.message, '錯誤')
+    }
+  }
+
+  const handleCloseAdminModal = () => {
+    setShowAdminModal(false)
+    setAdminPasscode('')
+  }
+
+  const handleAdminLogout = async () => {
+    try {
+      const response = await fetch('/api/user/admin/logout', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      })
+
+      const data = await response.json()
+      if (data.success) {
+        setIsAdmin(false)
+        showAlert('已切換為一般使用者', '成功')
+      } else {
+        showAlert('登出失敗：' + (data.error || '未知錯誤'), '錯誤')
+      }
+    } catch (error) {
+      console.error('Failed to logout admin:', error)
+      showAlert('登出失敗：' + error.message, '錯誤')
+    }
+  }
+
+  const handlePinNote = async (noteId) => {
+    const confirmed = await showConfirm('是否將此便利貼置頂？一次僅能有一則置頂。', '置頂便利貼')
+    if (!confirmed) {
+      return
+    }
+
+    try {
+      const response = await fetch(`/api/boards/${boardId}/notes/${noteId}/pin`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      })
+
+      const data = await response.json()
+      if (data.success) {
+        showAlert('已成功置頂便利貼', '成功')
+      } else {
+        showAlert('置頂失敗：' + (data.error || '未知錯誤'), '錯誤')
+      }
+    } catch (error) {
+      console.error('Failed to pin note:', error)
+      showAlert('置頂失敗：' + error.message, '錯誤')
+    }
+  }
+
   const deleteNote = async (index) => {
     const newNotes = notes.filter((_, i) => i !== index)
     setNotes(newNotes)
@@ -415,6 +540,7 @@ function App() {
     setDraftText('')
     setDraftColorIndex(0)
     setDraftByteCount(0)
+    setDraftPostPasscode('')
   }
 
   const handleCancelDraft = () => {
@@ -422,6 +548,7 @@ function App() {
     setDraftText('')
     setDraftColorIndex(0)
     setDraftByteCount(0)
+    setDraftPostPasscode('')
   }
 
   const handleCreateReply = (parentNoteId) => {
@@ -429,6 +556,7 @@ function App() {
     setReplyText('')
     setReplyColorIndex(0)
     setReplyByteCount(0)
+    setReplyPostPasscode('')
   }
 
   const handleCancelReply = () => {
@@ -436,12 +564,19 @@ function App() {
     setReplyText('')
     setReplyColorIndex(0)
     setReplyByteCount(0)
+    setReplyPostPasscode('')
   }
 
   const handleSubmitReply = async () => {
     const text = replyText.trim()
     if (!text) {
       showAlert('請輸入回覆內容！')
+      return
+    }
+
+    // 非管理者且需要通關碼時，檢查是否已填寫
+    if (!isAdmin && postPasscodeRequired && !replyPostPasscode.trim()) {
+      showAlert('請輸入發送用通關碼！')
       return
     }
 
@@ -455,7 +590,8 @@ function App() {
           text: text,
           author_key: myUUID,
           color_index: replyColorIndex,
-          parent_note_id: isReplyingTo
+          parent_note_id: isReplyingTo,
+          post_passcode: replyPostPasscode
         })
       })
 
@@ -465,6 +601,7 @@ function App() {
         setReplyText('')
         setReplyColorIndex(0)
         setReplyByteCount(0)
+        setReplyPostPasscode('')
         
         if (data.note && data.note.noteId) {
           setNewlyCreatedNoteId(data.note.noteId)
@@ -497,6 +634,12 @@ function App() {
       return
     }
 
+    // 非管理者且需要通關碼時，檢查是否已填寫
+    if (!isAdmin && postPasscodeRequired && !draftPostPasscode.trim()) {
+      showAlert('請輸入發送用通關碼！')
+      return
+    }
+
     try {
       const response = await fetch(`/api/boards/${boardId}/notes`, {
         method: 'POST',
@@ -506,7 +649,8 @@ function App() {
         body: JSON.stringify({
           text: text,
           author_key: myUUID,
-          color_index: draftColorIndex
+          color_index: draftColorIndex,
+          post_passcode: draftPostPasscode
         })
       })
 
@@ -516,6 +660,7 @@ function App() {
         setDraftText('')
         setDraftColorIndex(0)
         setDraftByteCount(0)
+        setDraftPostPasscode('')
         
         if (data.note && data.note.noteId) {
           setNewlyCreatedNoteId(data.note.noteId)
@@ -579,11 +724,41 @@ function App() {
     }
   }
 
-  const handleDeleteNote = async (noteId, isLanOnly = false) => {
-    const confirmed = await showConfirm('確定要封存這個便利貼嗎？', '確認封存')
+  const handleDeleteNote = async (noteId, isLanOnly = false, authorKey = null) => {
+    // 找到要刪除的 note，檢查是否為 root 節點
+    // root note 是在 notes 陣列中的，reply note 是在 note.replyNotes 中的
+    let isRootNote = false
+    let noteToDelete = notes.find(n => n.noteId === noteId)
+    
+    if (noteToDelete) {
+      // 找到了，這是一個 root note
+      isRootNote = true
+    } else {
+      // 沒找到，可能是 reply note，在某個 note 的 replyNotes 中
+      for (const note of notes) {
+        if (note.replyNotes) {
+          noteToDelete = note.replyNotes.find(r => r.noteId === noteId)
+          if (noteToDelete) {
+            isRootNote = false
+            break
+          }
+        }
+      }
+    }
+    
+    // 如果是 root 節點，增加警告訊息
+    let confirmMessage = '確定要封存這個便利貼嗎？'
+    if (isRootNote) {
+      confirmMessage += '\n\n⚠️ 會自動連帶隱藏整串便利貼內容'
+    }
+    
+    const confirmed = await showConfirm(confirmMessage, '確認封存')
     if (!confirmed) {
       return
     }
+
+    // 如果是管理者刪除他人的 note，使用該 note 的 author_key
+    const effectiveAuthorKey = authorKey || myUUID
 
     try {
       let response
@@ -594,7 +769,7 @@ function App() {
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({
-            author_key: myUUID
+            author_key: effectiveAuthorKey
           })
         })
       } else {
@@ -604,7 +779,8 @@ function App() {
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({
-            author_key: myUUID
+            author_key: effectiveAuthorKey,
+            is_admin: isAdmin && authorKey !== null
           })
         })
       }
@@ -623,11 +799,14 @@ function App() {
     return handleDeleteNote(noteId, false)
   }
 
-  const handleResendNote = async (noteId) => {
+  const handleResendNote = async (noteId, noteAuthorKey = null) => {
     const confirmed = await showConfirm('確認重新發送訊息？', '重新發送')
     if (!confirmed) {
       return
     }
+
+    // 判斷是否為管理者重新發送他人的 note
+    const isAdminResend = isAdmin && noteAuthorKey && noteAuthorKey !== myUUID
 
     try {
       const response = await fetch(`/api/boards/${boardId}/notes/${noteId}/resend`, {
@@ -636,7 +815,8 @@ function App() {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          author_key: myUUID
+          author_key: myUUID,
+          is_admin: isAdminResend
         })
       })
 
@@ -666,6 +846,10 @@ function App() {
   const handleSubmitColorChange = async () => {
     if (!colorPickerNote) return
 
+    // 判斷是否為管理者變更他人的 note 顏色
+    const isMyNote = colorPickerNote.userId === myUUID
+    const isAdminAction = isAdmin && !isMyNote
+
     try {
       const response = await fetch(`/api/boards/${boardId}/notes/${colorPickerNote.noteId}/color`, {
         method: 'POST',
@@ -674,7 +858,8 @@ function App() {
         },
         body: JSON.stringify({
           author_key: myUUID,
-          color_index: selectedColorIndex
+          color_index: selectedColorIndex,
+          is_admin: isAdminAction
         })
       })
 
@@ -731,6 +916,11 @@ function App() {
     })
 
     const sorted = [...filtered].sort((a, b) => {
+      // 置頂的便利貼永遠排在最前面
+      if (a.isPinedNote && !b.isPinedNote) return -1
+      if (!a.isPinedNote && b.isPinedNote) return 1
+      
+      // 如果都是置頂或都不是置頂，則按照選擇的排序方式排序
       if (sortOrder === 'newest') {
         return new Date(b.timestamp || 0) - new Date(a.timestamp || 0)
       } else if (sortOrder === 'oldest') {
@@ -837,6 +1027,7 @@ function App() {
     const isMyNote = senderID === myUUID
     const canEdit = isMyNote && status === 'LAN only' && !data.archived
     const canManage = isMyNote && status !== 'LAN only' && !data.archived
+    const canAdminDelete = isAdmin && !isMyNote && !data.archived && status !== 'LAN only'
     const isEditing = editingNoteId === data.noteId
 
     if (isEditing) {
@@ -905,74 +1096,138 @@ function App() {
           color: '#333'
         }}
       >
-        {(data.archived || data.isTempParentNote) && (
+        {(data.archived || data.isTempParentNote || data.isPinedNote) && (
           <div className="note-label">
-            {data.archived ? '已封存' : '暫無法取得前張便利貼'}
+            {data.archived ? '已封存' : data.isPinedNote ? '置頂' : '暫無法取得前張便利貼'}
           </div>
         )}
         <div className="note-content">{highlightText(text, keywordFilter)}</div>
         <div className="note-footer">
           <span className="note-time">{time}</span>
           <span className="note-footer-right">
-            {(status === 'sent' || status === 'LoRa sent') && data.userId === myUUID && !data.archived ? (
+            {(status === 'sent' || status === 'LoRa sent') && (data.userId === myUUID || isAdmin) && !data.archived ? (
               <span 
                 className="note-status clickable"
                 onClick={(e) => {
                   e.stopPropagation()
-                  handleResendNote(data.noteId)
+                  handleResendNote(data.noteId, data.userId)
                 }}
                 title="點擊重新發送"
               >
                 {getStatusDisplay(status)}
-                <span 
-                  ref={(el) => {
-                    if (data.noteId) {
-                      ackCounterRefs.current[data.noteId] = el
-                    }
-                  }}
-                  className="ack-counter"
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    if (ackTooltip === data.noteId) {
-                      setAckTooltip(null)
-                    } else {
-                      const rect = e.currentTarget.getBoundingClientRect()
-                      setAckTooltipPosition({
-                        top: rect.bottom + 8,
-                        left: rect.right - 150
-                      })
-                      setAckTooltip(data.noteId)
-                    }
-                  }}
-                >
-                  {(ackData[data.noteId] && ackData[data.noteId].length) || 0}
+                <span className="ack-counter-wrapper">
+                  <span 
+                    ref={(el) => {
+                      if (data.noteId) {
+                        ackCounterRefs.current[data.noteId] = el
+                      }
+                    }}
+                    className="ack-counter"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      if (ackTooltip === data.noteId) {
+                        setAckTooltip(null)
+                      } else {
+                        const rect = e.currentTarget.getBoundingClientRect()
+                        setAckTooltipPosition({
+                          top: rect.bottom + 8,
+                          left: rect.right - 150
+                        })
+                        setAckTooltip(data.noteId)
+                      }
+                    }}
+                  >
+                    {(ackData[data.noteId] && ackData[data.noteId].length) || 0}
+                  </span>
+                  <span
+                    className="ack-counter-touch-overlay"
+                    onTouchStart={(e) => {
+                      touchStartPos.current = {
+                        x: e.touches[0].clientX,
+                        y: e.touches[0].clientY
+                      }
+                    }}
+                    onTouchEnd={(e) => {
+                      const touchEndX = e.changedTouches[0].clientX
+                      const touchEndY = e.changedTouches[0].clientY
+                      const deltaX = Math.abs(touchEndX - touchStartPos.current.x)
+                      const deltaY = Math.abs(touchEndY - touchStartPos.current.y)
+                      
+                      if (deltaX < 10 && deltaY < 10) {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        if (ackTooltip === data.noteId) {
+                          setAckTooltip(null)
+                        } else {
+                          const rect = ackCounterRefs.current[data.noteId].getBoundingClientRect()
+                          setAckTooltipPosition({
+                            top: rect.bottom + 8,
+                            left: rect.right - 150
+                          })
+                          setAckTooltip(data.noteId)
+                        }
+                      }
+                    }}
+                  />
                 </span>
               </span>
             ) : (status === 'sent' || status === 'LoRa sent') ? (
               <span className="note-status">
                 {getStatusDisplay(status)}
-                <span 
-                  ref={(el) => {
-                    if (data.noteId) {
-                      ackCounterRefs.current[data.noteId] = el
-                    }
-                  }}
-                  className="ack-counter"
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    if (ackTooltip === data.noteId) {
-                      setAckTooltip(null)
-                    } else {
-                      const rect = e.currentTarget.getBoundingClientRect()
-                      setAckTooltipPosition({
-                        top: rect.bottom + 8,
-                        left: rect.right - 150
-                      })
-                      setAckTooltip(data.noteId)
-                    }
-                  }}
-                >
-                  {(ackData[data.noteId] && ackData[data.noteId].length) || 0}
+                <span className="ack-counter-wrapper">
+                  <span 
+                    ref={(el) => {
+                      if (data.noteId) {
+                        ackCounterRefs.current[data.noteId] = el
+                      }
+                    }}
+                    className="ack-counter"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      if (ackTooltip === data.noteId) {
+                        setAckTooltip(null)
+                      } else {
+                        const rect = e.currentTarget.getBoundingClientRect()
+                        setAckTooltipPosition({
+                          top: rect.bottom + 8,
+                          left: rect.right - 150
+                        })
+                        setAckTooltip(data.noteId)
+                      }
+                    }}
+                  >
+                    {(ackData[data.noteId] && ackData[data.noteId].length) || 0}
+                  </span>
+                  <span
+                    className="ack-counter-touch-overlay"
+                    onTouchStart={(e) => {
+                      touchStartPos.current = {
+                        x: e.touches[0].clientX,
+                        y: e.touches[0].clientY
+                      }
+                    }}
+                    onTouchEnd={(e) => {
+                      const touchEndX = e.changedTouches[0].clientX
+                      const touchEndY = e.changedTouches[0].clientY
+                      const deltaX = Math.abs(touchEndX - touchStartPos.current.x)
+                      const deltaY = Math.abs(touchEndY - touchStartPos.current.y)
+                      
+                      if (deltaX < 10 && deltaY < 10) {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        if (ackTooltip === data.noteId) {
+                          setAckTooltip(null)
+                        } else {
+                          const rect = ackCounterRefs.current[data.noteId].getBoundingClientRect()
+                          setAckTooltipPosition({
+                            top: rect.bottom + 8,
+                            left: rect.right - 150
+                          })
+                          setAckTooltip(data.noteId)
+                        }
+                      }
+                    }}
+                  />
                 </span>
               </span>
             ) : (
@@ -992,6 +1247,18 @@ function App() {
           <div className="note-actions">
             <button className="btn-delete" onClick={() => handleDeleteNote(data.noteId, false)}>🗑️</button>
             <button className="btn-color" onClick={() => handleOpenColorPicker(data)}>🎨</button>
+            {isAdmin && !isReply && !data.replyLoraMessageId && !data.isTempParentNote && !data.archived && !data.isPinedNote && (
+              <button className="btn-pin" onClick={() => handlePinNote(data.noteId)}>📌</button>
+            )}
+          </div>
+        )}
+        {canAdminDelete && (
+          <div className="note-actions">
+            <button className="btn-delete" onClick={() => handleDeleteNote(data.noteId, false, senderID)}>🗑️</button>
+            <button className="btn-color" onClick={() => handleOpenColorPicker(data)}>🎨</button>
+            {!isReply && !data.replyLoraMessageId && !data.isTempParentNote && !data.isPinedNote && (
+              <button className="btn-pin" onClick={() => handlePinNote(data.noteId)}>📌</button>
+            )}
           </div>
         )}
       </div>
@@ -1068,6 +1335,17 @@ function App() {
                   />
                 ))}
               </div>
+              {!isAdmin && postPasscodeRequired && (
+                <div className="passcode-input-container">
+                  <input
+                    type="password"
+                    className="passcode-input"
+                    placeholder="發送用通關碼"
+                    value={replyPostPasscode}
+                    onChange={(e) => setReplyPostPasscode(e.target.value)}
+                  />
+                </div>
+              )}
               <div className="draft-actions">
                 <button className="btn-cancel" onClick={handleCancelReply}>取消</button>
                 <button className="btn-submit" onClick={handleSubmitReply}>送出</button>
@@ -1107,6 +1385,11 @@ function App() {
               {channelErrorMessage}
             </div>
           )}
+        </div>
+        <div className="user-role-container" onClick={handleUserRoleClick} style={{ cursor: 'pointer' }}>
+          <div className="user-role-label">
+            {isAdmin ? '👑管理者' : '一般用戶'}
+          </div>
         </div>
       </header>
 
@@ -1207,6 +1490,17 @@ function App() {
                   />
                 ))}
               </div>
+              {!isAdmin && postPasscodeRequired && (
+                <div className="passcode-input-container">
+                  <input
+                    type="password"
+                    className="passcode-input"
+                    placeholder="發送用通關碼"
+                    value={draftPostPasscode}
+                    onChange={(e) => setDraftPostPasscode(e.target.value)}
+                  />
+                </div>
+              )}
               <div className="draft-actions">
                 <button className="btn-cancel" onClick={handleCancelDraft}>取消</button>
                 <button className="btn-submit" onClick={handleSubmitDraft}>送出</button>
@@ -1224,11 +1518,11 @@ function App() {
 
       <footer className="app-footer">
         <div className="footer-left">uid={myUUID}</div>
-        <div className="footer-right">MeshNoteboard v0.2.1</div>
+        <div className="footer-right">MeshNoteboard v0.2.2</div>
       </footer>
 
       {modalConfig.show && (
-        <div className="modal-overlay" onClick={() => modalConfig.type === 'alert' && modalConfig.onConfirm()}>
+        <div className="modal-overlay modal-overlay-top" onClick={() => modalConfig.type === 'alert' && modalConfig.onConfirm()}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">{modalConfig.title}</div>
             <div className="modal-body">{modalConfig.message}</div>
@@ -1299,6 +1593,38 @@ function App() {
                 {ack.displayId}
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {showAdminModal && (
+        <div className="modal-overlay" onClick={handleCloseAdminModal}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">管理者認證</div>
+            <div className="modal-body">
+              <p>請輸入管理者密碼以切換至管理者身份：</p>
+              <input
+                type="password"
+                className="admin-passcode-input"
+                placeholder="輸入管理者密碼"
+                value={adminPasscode}
+                onChange={(e) => setAdminPasscode(e.target.value)}
+                onKeyPress={(e) => {
+                  if (e.key === 'Enter') {
+                    handleAdminAuthenticate()
+                  }
+                }}
+                autoFocus
+              />
+            </div>
+            <div className="modal-actions">
+              <button className="modal-btn modal-btn-cancel" onClick={handleCloseAdminModal}>
+                取消
+              </button>
+              <button className="modal-btn modal-btn-confirm" onClick={handleAdminAuthenticate}>
+                確定
+              </button>
+            </div>
           </div>
         </div>
       )}
