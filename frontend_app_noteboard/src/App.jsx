@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { io } from 'socket.io-client'
+import LocationMap from './LocationMap'
+import LocationPicker from './LocationPicker'
 
 const DEFAULT_BOARD_ID = 'YourChannelName'
 
@@ -102,6 +104,30 @@ function App() {
   const [postPasscodeRequired, setPostPasscodeRequired] = useState(false)
   const [draftPostPasscode, setDraftPostPasscode] = useState('')
   const [replyPostPasscode, setReplyPostPasscode] = useState('')
+  const [showLocationPicker, setShowLocationPicker] = useState(false)
+  const [userLastLocations, setUserLastLocations] = useState({})
+
+  useEffect(() => {
+    const fetchUserLastLocation = async () => {
+      if (!myUUID) return
+      
+      try {
+        const response = await fetch(`/api/user/${myUUID}/last-location`)
+        const data = await response.json()
+        
+        if (data.success && data.location) {
+          setUserLastLocations(prev => ({
+            ...prev,
+            [myUUID]: data.location
+          }))
+        }
+      } catch (error) {
+        console.error('Failed to fetch user last location:', error)
+      }
+    }
+    
+    fetchUserLastLocation()
+  }, [myUUID])
 
   const fetchNotes = async (includeDeleted = false, targetBoardId = null) => {
     try {
@@ -1011,6 +1037,127 @@ function App() {
     }
   }
 
+  const handleOpenLocationPicker = () => {
+    setShowLocationPicker(true)
+  }
+
+  const handleCloseLocationPicker = () => {
+    setShowLocationPicker(false)
+  }
+
+  const saveUserLastLocation = async (mapState) => {
+    if (!mapState || !myUUID) return
+    
+    try {
+      await fetch(`/api/user/${myUUID}/last-location`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          lat: mapState.center.lat,
+          lng: mapState.center.lng,
+          zoom: mapState.zoom
+        })
+      })
+      
+      setUserLastLocations(prev => ({
+        ...prev,
+        [myUUID]: {
+          lat: mapState.center.lat,
+          lng: mapState.center.lng,
+          zoom: mapState.zoom
+        }
+      }))
+    } catch (error) {
+      console.error('Failed to save user last location:', error)
+    }
+  }
+
+  const handleLocationConfirm = (coordinateString, mapState) => {
+    const locationRegex = /([\u4e00-\u9fa5a-zA-Z0-9_\-]+)?@\(([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\)/g
+    
+    if (editingNoteId) {
+      const currentText = editText
+      const textWithoutCoords = currentText.replace(locationRegex, '').trim()
+      const newText = textWithoutCoords ? `${textWithoutCoords} ${coordinateString}` : coordinateString
+      const byteLength = getUTF8ByteLength(newText)
+      
+      if (byteLength <= MAX_BYTES) {
+        setEditText(newText)
+        setEditByteCount(byteLength)
+        setShowLocationPicker(false)
+        
+        saveUserLastLocation(mapState)
+        
+        if (draftTextareaRef.current) {
+          draftTextareaRef.current.focus()
+        }
+      } else {
+        showAlert('加入座標後會超過字數限制！', '錯誤')
+      }
+    } else if (isReplyingTo) {
+      const currentText = replyText
+      const textWithoutCoords = currentText.replace(locationRegex, '').trim()
+      const newText = textWithoutCoords ? `${textWithoutCoords} ${coordinateString}` : coordinateString
+      const byteLength = getUTF8ByteLength(newText)
+      
+      if (byteLength <= MAX_BYTES) {
+        setReplyText(newText)
+        setReplyByteCount(byteLength)
+        setShowLocationPicker(false)
+        
+        saveUserLastLocation(mapState)
+        
+        if (replyTextareaRef.current) {
+          replyTextareaRef.current.focus()
+        }
+      } else {
+        showAlert('加入座標後會超過字數限制！', '錯誤')
+      }
+    } else {
+      const currentText = draftText
+      const textWithoutCoords = currentText.replace(locationRegex, '').trim()
+      const newText = textWithoutCoords ? `${textWithoutCoords} ${coordinateString}` : coordinateString
+      const byteLength = getUTF8ByteLength(newText)
+      
+      if (byteLength <= MAX_BYTES) {
+        setDraftText(newText)
+        setDraftByteCount(byteLength)
+        setShowLocationPicker(false)
+        
+        saveUserLastLocation(mapState)
+        
+        if (draftTextareaRef.current) {
+          draftTextareaRef.current.focus()
+        }
+      } else {
+        showAlert('加入座標後會超過字數限制！', '錯誤')
+      }
+    }
+  }
+
+  const parseLocationsFromText = (text) => {
+    const locationRegex = /([\u4e00-\u9fa5a-zA-Z0-9_\-]+)?@\(([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\)/g
+    const locations = []
+    let match
+    
+    while ((match = locationRegex.exec(text)) !== null) {
+      const location = {
+        lat: parseFloat(match[2]),
+        lng: parseFloat(match[3])
+      }
+      
+      if (match[1] && match[1].trim()) {
+        location.label = match[1].trim()
+      }
+      
+      locations.push(location)
+    }
+    
+    return locations.length > 0 ? locations : null
+  }
+
   const highlightText = (text, keyword) => {
     if (!keyword.trim()) {
       return text
@@ -1076,6 +1223,15 @@ function App() {
             placeholder="輸入內容..."
             autoFocus
           />
+          <div className="draft-tools">
+            <button 
+              className="btn-location-picker"
+              onClick={handleOpenLocationPicker}
+              title="地圖座標"
+            >
+              📍 地圖座標
+            </button>
+          </div>
           <div className="byte-counter-container">
             <div className="byte-counter-bar">
               <div 
@@ -1128,6 +1284,11 @@ function App() {
           </div>
         )}
         <div className="note-content">{highlightText(text, keywordFilter)}</div>
+        {parseLocationsFromText(text) && (
+          <div style={{ marginTop: '10px', marginBottom: '10px' }}>
+            <LocationMap locations={parseLocationsFromText(text)} />
+          </div>
+        )}
         <div className="note-footer">
           <span className="note-time">{time}</span>
           <span className="note-footer-right">
@@ -1363,6 +1524,15 @@ function App() {
                 placeholder="輸入回覆內容..."
                 autoFocus
               />
+              <div className="draft-tools">
+                <button 
+                  className="btn-location-picker"
+                  onClick={handleOpenLocationPicker}
+                  title="加入地圖座標"
+                >
+                  📍 地圖座標
+                </button>
+              </div>
               <div className="byte-counter-container">
                 <div className="byte-counter-bar">
                   <div 
@@ -1518,6 +1688,15 @@ function App() {
                 placeholder="輸入內容..."
                 autoFocus
               />
+              <div className="draft-tools">
+                <button 
+                  className="btn-location-picker"
+                  onClick={handleOpenLocationPicker}
+                  title="加入地圖座標"
+                >
+                  📍 地圖座標
+                </button>
+              </div>
               <div className="byte-counter-container">
                 <div className="byte-counter-bar">
                   <div 
@@ -1570,7 +1749,7 @@ function App() {
 
       <footer className="app-footer">
         <div className="footer-left">uid={myUUID}</div>
-        <div className="footer-right">MeshNoteboard v0.2.3</div>
+        <div className="footer-right">MeshNoteboard v0.3.0</div>
       </footer>
 
       {modalConfig.show && (
@@ -1707,6 +1886,15 @@ function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {showLocationPicker && (
+        <LocationPicker
+          onConfirm={handleLocationConfirm}
+          onCancel={handleCloseLocationPicker}
+          initialText={editingNoteId ? editText : draftText}
+          lastLocation={myUUID ? userLastLocations[myUUID] : null}
+        />
       )}
     </>
   )

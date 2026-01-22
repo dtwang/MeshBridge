@@ -101,6 +101,7 @@ DB_PATH = 'noteboard.db'
 MAX_NOTES = 200
 
 admin_users = set()
+user_last_locations = {}
 
 COLOR_PALETTE = [
     'hsl(0, 70%, 85%)',      # 0: Red
@@ -2462,6 +2463,310 @@ def get_note_acks(board_id, note_id):
         
     except Exception as e:
         print(f"取得 ACK 記錄失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/user/<user_id>/last-location', methods=['GET'])
+def get_user_last_location(user_id):
+    """取得使用者最後的地圖位置和縮放等級（從記憶體中）"""
+    try:
+        location = user_last_locations.get(user_id)
+        if location:
+            return jsonify({
+                'success': True,
+                'location': location
+            }), 200
+        else:
+            return jsonify({
+                'success': True,
+                'location': None
+            }), 200
+    except Exception as e:
+        print(f"取得使用者最後位置失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/user/<user_id>/last-location', methods=['POST'])
+def set_user_last_location(user_id):
+    """儲存使用者最後的地圖位置和縮放等級（到記憶體中）"""
+    try:
+        data = request.get_json()
+        lat = data.get('lat')
+        lng = data.get('lng')
+        zoom = data.get('zoom')
+        
+        if lat is None or lng is None or zoom is None:
+            return jsonify({
+                'success': False,
+                'error': 'Missing required fields: lat, lng, zoom'
+            }), 400
+        
+        user_last_locations[user_id] = {
+            'lat': lat,
+            'lng': lng,
+            'zoom': zoom
+        }
+        
+        return jsonify({
+            'success': True,
+            'location': user_last_locations[user_id]
+        }), 200
+        
+    except Exception as e:
+        print(f"儲存使用者最後位置失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/tiles/<tileset>/<int:z>/<int:x>/<int:y>')
+def get_tile(tileset, z, x, y):
+    """提供 MBTiles 的 tile 資料"""
+    try:
+        mbtiles_path = os.path.join(os.path.dirname(__file__), 'maps', f'{tileset}.mbtiles')
+        
+        if not os.path.exists(mbtiles_path):
+            return jsonify({
+                'success': False,
+                'error': f'Tileset {tileset} not found'
+            }), 404
+        
+        conn = sqlite3.connect(mbtiles_path)
+        cursor = conn.cursor()
+        
+        # MBTiles 使用 TMS 座標系統，需要轉換 y 座標
+        tms_y = (2 ** z) - 1 - y
+        
+        cursor.execute('''
+            SELECT tile_data FROM tiles 
+            WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?
+        ''', (z, x, tms_y))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            tile_data = row[0]
+            response = make_response(tile_data)
+            
+            # 檢查 tile 格式
+            if tile_data[:8] == b'\x89\x50\x4E\x47\x0D\x0A\x1A\x0A':
+                response.headers['Content-Type'] = 'image/png'
+            elif tile_data[:2] == b'\xFF\xD8':
+                response.headers['Content-Type'] = 'image/jpeg'
+            elif tile_data[:2] == b'\x1f\x8b':
+                response.headers['Content-Type'] = 'application/x-protobuf'
+                response.headers['Content-Encoding'] = 'gzip'
+            else:
+                response.headers['Content-Type'] = 'application/octet-stream'
+            
+            response.headers['Cache-Control'] = 'public, max-age=86400'
+            return response
+        else:
+            return '', 204
+            
+    except Exception as e:
+        print(f"取得 tile 失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/tiles/<tileset>/style.json')
+def get_style(tileset):
+    """提供 MapLibre style.json"""
+    try:
+        mbtiles_path = os.path.join(os.path.dirname(__file__), 'maps', f'{tileset}.mbtiles')
+        
+        if not os.path.exists(mbtiles_path):
+            return jsonify({
+                'success': False,
+                'error': f'Tileset {tileset} not found'
+            }), 404
+        
+        conn = sqlite3.connect(mbtiles_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # 讀取 metadata
+        cursor.execute('SELECT name, value FROM metadata')
+        metadata = {row['name']: row['value'] for row in cursor.fetchall()}
+        
+        # 取得 bounds 和 zoom 範圍
+        bounds = metadata.get('bounds', '-180,-85,180,85').split(',')
+        bounds = [float(b) for b in bounds]
+        
+        minzoom = int(metadata.get('minzoom', 0))
+        maxzoom = int(metadata.get('maxzoom', 14))
+        
+        # 檢查是否為 raster tiles
+        tile_format = metadata.get('format', 'png')
+        tile_type = metadata.get('type', 'baselayer')
+        is_raster = tile_format in ['png', 'jpg', 'jpeg', 'webp'] or tile_type == 'baselayer'
+        
+        conn.close()
+        
+        # 建立 MapLibre style
+        if is_raster:
+            # Raster tiles style
+            # MapLibre 的 maxZoom 需要比 tile 的實際 maxzoom 多 1，才能正確顯示最大縮放層級
+            style = {
+                "version": 8,
+                "name": metadata.get('name', tileset),
+                "sources": {
+                    tileset: {
+                        "type": "raster",
+                        "tiles": [f"http://{{host}}/tiles/{tileset}/{{z}}/{{x}}/{{y}}"],
+                        "tileSize": 256,
+                        "minzoom": minzoom,
+                        "maxzoom": maxzoom,
+                        "bounds": bounds
+                    }
+                },
+                "layers": [
+                    {
+                        "id": "raster-tiles",
+                        "type": "raster",
+                        "source": tileset,
+                        "minzoom": minzoom,
+                        "maxzoom": maxzoom
+                    }
+                ]
+            }
+        else:
+            # Vector tiles style
+            style = {
+                "version": 8,
+                "name": metadata.get('name', tileset),
+                "sources": {
+                    tileset: {
+                        "type": "vector",
+                        "tiles": [f"http://{{host}}/tiles/{tileset}/{{z}}/{{x}}/{{y}}"],
+                        "minzoom": minzoom,
+                        "maxzoom": maxzoom,
+                        "bounds": bounds
+                    }
+                },
+                "layers": [
+                    {
+                        "id": "background",
+                        "type": "background",
+                        "paint": {
+                            "background-color": "#f8f8f8"
+                        }
+                    },
+                    {
+                        "id": "water",
+                        "type": "fill",
+                        "source": tileset,
+                        "source-layer": "water",
+                        "paint": {
+                            "fill-color": "#a0c8f0"
+                        }
+                    },
+                    {
+                        "id": "landuse",
+                        "type": "fill",
+                        "source": tileset,
+                        "source-layer": "landuse",
+                        "paint": {
+                            "fill-color": "#e8e8e8"
+                        }
+                    },
+                    {
+                        "id": "roads",
+                        "type": "line",
+                        "source": tileset,
+                        "source-layer": "transportation",
+                        "paint": {
+                            "line-color": "#ffffff",
+                            "line-width": 2
+                        }
+                    },
+                    {
+                        "id": "buildings",
+                        "type": "fill",
+                        "source": tileset,
+                        "source-layer": "building",
+                        "paint": {
+                            "fill-color": "#d0d0d0",
+                            "fill-opacity": 0.7
+                        }
+                    }
+                ]
+            }
+        
+        # 替換 host placeholder
+        host = request.host
+        style_json = jsonify(style).get_data(as_text=True)
+        style_json = style_json.replace('{host}', host)
+        
+        response = make_response(style_json)
+        response.headers['Content-Type'] = 'application/json'
+        return response
+        
+    except Exception as e:
+        print(f"取得 style.json 失敗: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/tiles/<tileset>/tilejson.json')
+def get_tilejson(tileset):
+    """提供 TileJSON metadata"""
+    try:
+        mbtiles_path = os.path.join(os.path.dirname(__file__), 'maps', f'{tileset}.mbtiles')
+        
+        if not os.path.exists(mbtiles_path):
+            return jsonify({
+                'success': False,
+                'error': f'Tileset {tileset} not found'
+            }), 404
+        
+        conn = sqlite3.connect(mbtiles_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # 讀取 metadata
+        cursor.execute('SELECT name, value FROM metadata')
+        metadata = {row['name']: row['value'] for row in cursor.fetchall()}
+        
+        conn.close()
+        
+        # 取得 bounds 和 zoom 範圍
+        bounds = metadata.get('bounds', '-180,-85,180,85').split(',')
+        bounds = [float(b) for b in bounds]
+        
+        center_str = metadata.get('center', '0,0,0').split(',')
+        center = [float(center_str[0]), float(center_str[1]), int(center_str[2])]
+        
+        minzoom = int(metadata.get('minzoom', 0))
+        maxzoom = int(metadata.get('maxzoom', 14))
+        
+        # 建立 TileJSON
+        tilejson = {
+            "tilejson": "3.0.0",
+            "name": metadata.get('name', tileset),
+            "description": metadata.get('description', ''),
+            "version": metadata.get('version', '1.0.0'),
+            "attribution": metadata.get('attribution', ''),
+            "scheme": "xyz",
+            "tiles": [f"http://{request.host}/tiles/{tileset}/{{z}}/{{x}}/{{y}}"],
+            "minzoom": minzoom,
+            "maxzoom": maxzoom,
+            "bounds": bounds,
+            "center": center
+        }
+        
+        return jsonify(tilejson), 200
+        
+    except Exception as e:
+        print(f"取得 tilejson.json 失敗: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
