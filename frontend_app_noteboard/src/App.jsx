@@ -54,6 +54,7 @@ function App() {
   const [loraOnline, setLoraOnline] = useState(false)
   const [channelValidated, setChannelValidated] = useState(false)
   const [channelErrorMessage, setChannelErrorMessage] = useState(null)
+  const [powerIssue, setPowerIssue] = useState(false)
   const [boardId, setBoardId] = useState(DEFAULT_BOARD_ID)
   const [myUUID, setMyUUID] = useState('')
   const [isCreatingNote, setIsCreatingNote] = useState(false)
@@ -90,6 +91,11 @@ function App() {
   const ackTooltipRef = useRef(null)
   const ackCounterRefs = useRef({})
   const touchStartPos = useRef({ x: 0, y: 0 })
+  const [senderTooltip, setSenderTooltip] = useState(null)
+  const [senderTooltipPosition, setSenderTooltipPosition] = useState({ top: 0, left: 0 })
+  const [senderTooltipData, setSenderTooltipData] = useState(null)
+  const senderTooltipRef = useRef(null)
+  const senderStatusRefs = useRef({})
   const [isAdmin, setIsAdmin] = useState(false)
   const [showAdminModal, setShowAdminModal] = useState(false)
   const [adminPasscode, setAdminPasscode] = useState('')
@@ -209,6 +215,7 @@ function App() {
         setLoraOnline(data.online)
         setChannelValidated(data.channel_validated !== false)
         setChannelErrorMessage(data.error_message || null)
+        setPowerIssue(data.power_issue || false)
         
         if (data.online && data.channel_validated === false) {
           console.log('⚠️ LoRa 已連線，但 Channel 名稱不符合設定')
@@ -298,6 +305,25 @@ function App() {
       }
     }
   }, [ackTooltip])
+
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (senderTooltip && senderTooltipRef.current && !senderTooltipRef.current.contains(event.target)) {
+        const senderStatus = event.target.closest('.note-status.sender-clickable')
+        if (!senderStatus) {
+          setSenderTooltip(null)
+          setSenderTooltipData(null)
+        }
+      }
+    }
+
+    if (senderTooltip) {
+      document.addEventListener('mousedown', handleClickOutside)
+      return () => {
+        document.removeEventListener('mousedown', handleClickOutside)
+      }
+    }
+  }, [senderTooltip])
 
   useEffect(() => {
     const handleScroll = () => {
@@ -1230,6 +1256,32 @@ function App() {
                   />
                 </span>
               </span>
+            ) : status === 'LoRa received' && data.senderNodeDisplay ? (
+              <span 
+                ref={(el) => {
+                  if (data.noteId) {
+                    senderStatusRefs.current[data.noteId] = el
+                  }
+                }}
+                className="note-status sender-clickable"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  if (senderTooltip === data.noteId) {
+                    setSenderTooltip(null)
+                    setSenderTooltipData(null)
+                  } else {
+                    const rect = e.currentTarget.getBoundingClientRect()
+                    setSenderTooltipPosition({
+                      top: rect.bottom + 8,
+                      left: rect.right - 150
+                    })
+                    setSenderTooltip(data.noteId)
+                    setSenderTooltipData(data)
+                  }
+                }}
+              >
+                {getStatusDisplay(status)}
+              </span>
             ) : (
               <span className="note-status">
                 {getStatusDisplay(status)}
@@ -1378,7 +1430,7 @@ function App() {
         <div className="status-container" style={{ position: 'relative' }}>
           <div className={`status-dot ${loraOnline ? (channelValidated ? 'online' : 'warning') : ''}`}></div>
           <div className="status-text">
-            {loraOnline ? (channelValidated ? 'LoRa 連線' : 'LoRa 連線') : 'LoRa 斷線'}
+            {loraOnline ? (channelValidated ? 'LoRa 連線' : 'LoRa 連線') : powerIssue ? 'LoRa 斷線 (RPi供電不足)' : 'LoRa 斷線'}
           </div>
           {loraOnline && !channelValidated && channelErrorMessage && (
             <div className="status-tooltip">
@@ -1518,7 +1570,7 @@ function App() {
 
       <footer className="app-footer">
         <div className="footer-left">uid={myUUID}</div>
-        <div className="footer-right">MeshNoteboard v0.2.2</div>
+        <div className="footer-right">MeshNoteboard v0.2.3</div>
       </footer>
 
       {modalConfig.show && (
@@ -1593,6 +1645,34 @@ function App() {
                 {ack.displayId}
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {senderTooltip && senderTooltipData?.senderNodeDisplay && (
+        <div 
+          className="ack-tooltip" 
+          ref={senderTooltipRef}
+          style={{
+            top: `${senderTooltipPosition.top}px`,
+            left: `${senderTooltipPosition.left}px`
+          }}
+        >
+          <button 
+            className="ack-tooltip-close"
+            onClick={(e) => {
+              e.stopPropagation()
+              setSenderTooltip(null)
+              setSenderTooltipData(null)
+            }}
+          >
+            ✕
+          </button>
+          <div className="ack-tooltip-header">發送節點</div>
+          <div className="ack-tooltip-list">
+            <div className="ack-tooltip-item">
+              {senderTooltipData.senderNodeDisplay}
+            </div>
           </div>
         </div>
       )}

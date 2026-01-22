@@ -16,6 +16,7 @@ from flask_socketio import SocketIO, emit
 from meshtastic.serial_interface import SerialInterface
 from pubsub import pub
 from config import BOARD_MESSAGE_CHANEL_NAME, SEND_INTERVAL_SECOND, ACK_TIMEOUT_SECONDS, MAX_NOTE_SHOW, MAX_ARCHIVED_NOTE_SHOW, NOTEBOARD_ADMIN_PASSCODE
+from app import get_power_status
 
 # 抑制 Meshtastic 的 protobuf 解析錯誤日誌（這些是暫時性錯誤，不影響功能）
 logging.getLogger('meshtastic.mesh_interface').setLevel(logging.CRITICAL)
@@ -146,6 +147,7 @@ def init_database():
             grid_mode TEXT NOT NULL DEFAULT '',
             grid_x INTEGER NOT NULL DEFAULT 0,
             grid_y INTEGER NOT NULL DEFAULT 0,
+            lora_node_id TEXT,
             FOREIGN KEY (reply_lora_msg_id) REFERENCES notes(note_id)
         )
     ''')
@@ -169,6 +171,27 @@ def init_database():
     conn.commit()
     conn.close()
     print("資料庫初始化完成")
+
+def migrate_database():
+    """檢查並執行資料庫遷移"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("PRAGMA table_info(notes)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'lora_node_id' not in columns:
+            print("[資料庫遷移] 偵測到 notes 表缺少 lora_node_id 欄位，開始遷移...")
+            cursor.execute('ALTER TABLE notes ADD COLUMN lora_node_id TEXT')
+            conn.commit()
+            print("[資料庫遷移] 已成功新增 lora_node_id 欄位")
+        else:
+            print("[資料庫遷移] notes 表已包含 lora_node_id 欄位，無需遷移")
+    except Exception as e:
+        print(f"[資料庫遷移] 遷移失敗: {e}")
+    finally:
+        conn.close()
 
 def get_time():
     return time.strftime("%H:%M", time.localtime())
@@ -516,7 +539,7 @@ def pin_note_by_lora_msg_id(lora_msg_id, author_key):
         print(f"置頂 note 失敗: {e}")
         return False
 
-def save_lora_note(lora_msg_id, board_id, body, bg_color='', author_key='', reply_lora_msg_id=None):
+def save_lora_note(lora_msg_id, board_id, body, bg_color='', author_key='', reply_lora_msg_id=None, lora_node_id=''):
     """儲存 LoRa 接收的 note"""
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -527,9 +550,9 @@ def save_lora_note(lora_msg_id, board_id, body, bg_color='', author_key='', repl
         
         cursor.execute('''
             INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
-                             created_at, updated_at, author_key, rev, deleted, lora_msg_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?)
-        ''', (note_id, reply_lora_msg_id, board_id, body, bg_color, status, timestamp, timestamp, author_key, lora_msg_id))
+                             created_at, updated_at, author_key, rev, deleted, lora_msg_id, lora_node_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+        ''', (note_id, reply_lora_msg_id, board_id, body, bg_color, status, timestamp, timestamp, author_key, lora_msg_id, lora_node_id))
         
         conn.commit()
         conn.close()
@@ -668,7 +691,7 @@ def get_notes_from_db(board_id, include_deleted=False):
         if include_deleted:
             cursor.execute('''
                 SELECT note_id, reply_lora_msg_id, body, bg_color, status, 
-                       created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, is_pined_note
+                       created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, is_pined_note, lora_node_id
                 FROM notes 
                 WHERE board_id = ?
                 ORDER BY created_at DESC
@@ -677,7 +700,7 @@ def get_notes_from_db(board_id, include_deleted=False):
         else:
             cursor.execute('''
                 SELECT note_id, reply_lora_msg_id, body, bg_color, status, 
-                       created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, is_pined_note
+                       created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, is_pined_note, lora_node_id
                 FROM notes 
                 WHERE board_id = ? AND deleted = 0
                 ORDER BY created_at DESC
@@ -695,6 +718,12 @@ def get_notes_from_db(board_id, include_deleted=False):
             elif author_display.startswith('user-'):
                 author_display = "WebUser"
             
+            lora_node_id = row['lora_node_id'] or ''
+            sender_node_display = ''
+            if lora_node_id and lora_node_id.startswith('lora-'):
+                raw_node_id = lora_node_id.replace('lora-', '')
+                sender_node_display = f"LoRa-{raw_node_id[-4:]}" if len(raw_node_id) > 4 else raw_node_id
+            
             notes.append({
                 'noteId': row['note_id'],
                 'replyLoraMessageId': row['reply_lora_msg_id'],
@@ -711,7 +740,9 @@ def get_notes_from_db(board_id, include_deleted=False):
                 'archived': row['deleted'] == 1,
                 'loraMessageId': row['lora_msg_id'],
                 'isTempParentNote': row['is_temp_parent_note'] == 1,
-                'isPinedNote': row['is_pined_note'] == 1
+                'isPinedNote': row['is_pined_note'] == 1,
+                'loraNodeId': lora_node_id,
+                'senderNodeDisplay': sender_node_display
             })
         
         conn.close()
@@ -828,7 +859,13 @@ def onReceive(packet, interface):
         
         if 'decoded' in packet and packet['decoded']['portnum'] == 'TEXT_MESSAGE_APP':
             msg = packet['decoded']['text']
-            raw_id = packet.get('fromId', 'Unknown')
+            raw_id = packet.get('fromId')
+            if raw_id is None:
+                from_num = packet.get('from')
+                if from_num is not None:
+                    raw_id = f"!{from_num:08x}"
+                else:
+                    raw_id = 'Unknown'
             sender_display = f"LoRa-{raw_id[-4:]}" if raw_id and len(raw_id) > 4 else (raw_id or 'Unknown')
             lora_uuid = f"lora-{raw_id}"
             lora_msg_id = str(packet.get('id', 'N/A'))
@@ -869,7 +906,8 @@ def onReceive(packet, interface):
                     board_id=BOARD_MESSAGE_CHANEL_NAME,
                     body=body,
                     bg_color='',
-                    author_key=''
+                    author_key='',
+                    lora_node_id=lora_uuid
                 ):
                     should_refresh = True
                     print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
@@ -887,7 +925,8 @@ def onReceive(packet, interface):
                         board_id=BOARD_MESSAGE_CHANEL_NAME,
                         body=body,
                         bg_color='',
-                        author_key=''
+                        author_key='',
+                        lora_node_id=lora_uuid
                     ):
                         should_refresh = True
                         print(f"[重發訊息寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
@@ -1010,10 +1049,10 @@ def onReceive(packet, interface):
                     
                     cursor.execute('''
                         INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
-                                         created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+                                         created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, lora_node_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
                     ''', (reply_note_id, reply_lora_msg_id, BOARD_MESSAGE_CHANEL_NAME, body, '', status, 
-                          timestamp, timestamp, '', lora_msg_id, is_temp_parent))
+                          timestamp, timestamp, '', lora_msg_id, is_temp_parent, lora_uuid))
                     
                     conn.commit()
                     conn.close()
@@ -1060,10 +1099,10 @@ def onReceive(packet, interface):
                             
                             cursor.execute('''
                                 INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
-                                                 created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+                                                 created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, lora_node_id)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
                             ''', (reply_note_id, reply_lora_msg_id, BOARD_MESSAGE_CHANEL_NAME, body, '', status, 
-                                  timestamp, timestamp, '', resend_lora_msg_id, is_temp_parent))
+                                  timestamp, timestamp, '', resend_lora_msg_id, is_temp_parent, lora_uuid))
                             
                             conn.commit()
                             
@@ -1293,11 +1332,27 @@ def mesh_loop():
                 if lora_connected:
                     lora_connected = False
                     channel_validated = False
-                    socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None})
+                    socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False})
                 
                 target_port = scan_for_meshtastic()
                 if target_port:
-                    print(f"發現裝置於: {target_port}，嘗試連線...")
+                    print(f"發現裝置於: {target_port}，檢查電源狀態...")
+                    
+                    # 檢查電源狀態
+                    power_status = get_power_status()
+                    if not power_status['is_normal']:
+                        print(f"[✗] 電源狀態異常: {power_status['error_message']}")
+                        print(f"[✗] 跳過連線，等待電源恢復正常...")
+                        socketio.emit('lora_status', {
+                            'online': False, 
+                            'channel_validated': False,
+                            'error_message': None,
+                            'power_issue': True
+                        })
+                        time.sleep(5)
+                        continue
+                    else:
+                        print(f"[✓] 電源狀態正常，嘗試連線...")
                     
                     # 嘗試連線，最多重試 3 次
                     max_retries = 3
@@ -1367,7 +1422,8 @@ def mesh_loop():
                     socketio.emit('lora_status', {
                         'online': True, 
                         'channel_validated': is_channel_valid,
-                        'error_message': error_msg
+                        'error_message': error_msg,
+                        'power_issue': False
                     })
                 else:
                     time.sleep(3)
@@ -1382,7 +1438,8 @@ def mesh_loop():
                     socketio.emit('lora_status', {
                         'online': True, 
                         'channel_validated': is_channel_valid,
-                        'error_message': error_msg
+                        'error_message': error_msg,
+                        'power_issue': False
                     })
 
         except Exception as e:
@@ -1398,7 +1455,7 @@ def mesh_loop():
             if lora_connected:
                 lora_connected = False
                 channel_validated = False
-                socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None})
+                socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False})
                 
                 # 檢測 USB 連線異常，通知前端
                 if "裝置路徑" in error_str and "已消失" in error_str:
@@ -2428,6 +2485,7 @@ def handle_connect():
 
 def run_noteboard_app():
     init_database()
+    migrate_database()
     socketio.start_background_task(target=mesh_loop)
     socketio.start_background_task(target=send_scheduler_loop)
     print(f"MeshBridge NoteBoard 伺服器啟動中 (Port 80, Channel: {BOARD_MESSAGE_CHANEL_NAME})...")
