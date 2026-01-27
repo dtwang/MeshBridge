@@ -5,9 +5,8 @@ import mapInstanceManager from './MapInstanceManager'
 
 let pickerIdCounter = 0
 
-function isAndroid() {
-  const ua = navigator.userAgent.toLowerCase()
-  return /android/.test(ua)
+function isMobileLayout() {
+  return window.innerWidth <= 768
 }
 
 function LocationPicker({ onConfirm, onCancel, initialLat: propInitialLat = 25.0330, initialLng: propInitialLng = 121.5654, initialText = '', lastLocation = null }) {
@@ -17,8 +16,8 @@ function LocationPicker({ onConfirm, onCancel, initialLat: propInitialLat = 25.0
   const selectedIndexRef = useRef(0)
   const MAX_LOCATIONS = 5
   const componentId = useRef(`location-picker-${++pickerIdCounter}`)
-  const isAndroidDevice = useRef(isAndroid())
-  const [canRenderMap, setCanRenderMap] = useState(!isAndroid())
+  const isMobileDevice = useRef(isMobileLayout())
+  const [canRenderMap, setCanRenderMap] = useState(!isMobileLayout())
   const [initialLat, setInitialLat] = useState(propInitialLat)
   const [initialLng, setInitialLng] = useState(propInitialLng)
   const [isLoadingConfig, setIsLoadingConfig] = useState(true)
@@ -150,13 +149,13 @@ function LocationPicker({ onConfirm, onCancel, initialLat: propInitialLat = 25.0
 
   useEffect(() => {
     const requestMapInstance = async () => {
-      // 非 Android 設備：直接允許渲染
-      if (!isAndroidDevice.current) {
+      // 非手機版型：直接允許渲染
+      if (!isMobileDevice.current) {
         setCanRenderMap(true)
         return
       }
 
-      // Android 設備：請求實例（最高優先級）
+      // 手機版型：請求實例（最高優先級）
       const result = await mapInstanceManager.requestInstance(componentId.current, 100)
       setCanRenderMap(result.allowed)
     }
@@ -164,8 +163,8 @@ function LocationPicker({ onConfirm, onCancel, initialLat: propInitialLat = 25.0
     requestMapInstance()
 
     return () => {
-      // 只在 Android 設備上釋放實例
-      if (isAndroidDevice.current) {
+      // 只在手機版型上釋放實例
+      if (isMobileDevice.current) {
         mapInstanceManager.releaseInstance(componentId.current)
       }
     }

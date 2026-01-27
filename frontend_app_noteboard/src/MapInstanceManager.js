@@ -1,17 +1,9 @@
-function isAndroid() {
-  const ua = navigator.userAgent.toLowerCase()
-  return /android/.test(ua)
-}
-
-function isIOSSafari() {
-  const ua = navigator.userAgent.toLowerCase()
-  const isIOS = /iphone|ipad|ipod/.test(ua)
-  const isSafari = /safari/.test(ua) && !/chrome|crios|fxios|edgios/.test(ua)
-  return isIOS && isSafari
+function isMobileLayout() {
+  return window.innerWidth <= 768
 }
 
 function needsWebGLControl() {
-  return isAndroid() || isIOSSafari()
+  return isMobileLayout()
 }
 
 class MapInstanceManager {
