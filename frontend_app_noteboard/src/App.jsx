@@ -1780,7 +1780,7 @@ function App() {
 
       <footer className="app-footer">
         <div className="footer-left">uid={myUUID}</div>
-        <div className="footer-right">MeshNoteboard v0.3.1</div>
+        <div className="footer-right">MeshNoteboard v0.3.2</div>
       </footer>
 
       {modalConfig.show && (
@@ -1923,7 +1923,7 @@ function App() {
         <LocationPicker
           onConfirm={handleLocationConfirm}
           onCancel={handleCloseLocationPicker}
-          initialText={editingNoteId ? editText : draftText}
+          initialText={editingNoteId ? editText : (isReplyingTo ? replyText : draftText)}
           lastLocation={myUUID ? userLastLocations[myUUID] : null}
         />
       )}
