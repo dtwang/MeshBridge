@@ -1,13 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
-import mapInstanceManager from './MapInstanceManager'
+import mapInstanceManager, { isMobileLayout } from './MapInstanceManager'
 
 let pickerIdCounter = 0
-
-function isMobileLayout() {
-  return window.innerWidth <= 768
-}
 
 function LocationPicker({ onConfirm, onCancel, initialLat: propInitialLat = 25.0330, initialLng: propInitialLng = 121.5654, initialText = '', lastLocation = null }) {
   const mapContainer = useRef(null)
@@ -54,11 +50,32 @@ function LocationPicker({ onConfirm, onCancel, initialLat: propInitialLat = 25.0
     return [{ lat: initialLat, lng: initialLng, label: '' }]
   }
 
+  const calculateBounds = (locations) => {
+    if (locations.length === 0) return null
+    if (locations.length === 1) return null
+    
+    const lngs = locations.map(loc => loc.lng)
+    const lats = locations.map(loc => loc.lat)
+    
+    return [
+      [Math.min(...lngs), Math.min(...lats)],
+      [Math.max(...lngs), Math.max(...lats)]
+    ]
+  }
+
   const getInitialZoom = () => {
     if (initialText) {
       const parsedLocations = parseLocationsFromText(initialText)
-      if (parsedLocations.length > 0) {
-        return parsedLocations.length === 1 ? 13 : 12
+      if (parsedLocations.length > 1) {
+        // 多個坐標時使用固定 zoom，因為稍後會用 fitBounds 調整
+        return 12
+      }
+      // 單一坐標時，優先使用 lastLocation.zoom
+      if (parsedLocations.length === 1 && lastLocation && lastLocation.zoom) {
+        return lastLocation.zoom
+      }
+      if (parsedLocations.length === 1) {
+        return 13
       }
     }
     if (lastLocation && lastLocation.zoom) {
@@ -116,16 +133,18 @@ function LocationPicker({ onConfirm, onCancel, initialLat: propInitialLat = 25.0
   }, [propInitialLat, propInitialLng])
 
   const [locations, setLocations] = useState(() => {
-    // 初始化時先使用 prop 的預設值
+    // 優先順序 1: initialText 中的坐標
     if (initialText) {
       const parsedLocations = parseLocationsFromText(initialText)
       if (parsedLocations.length > 0) {
         return parsedLocations
       }
     }
+    // 優先順序 2: lastLocation
     if (lastLocation) {
       return [{ lat: lastLocation.lat, lng: lastLocation.lng, label: '' }]
     }
+    // 優先順序 3: prop 預設值
     return [{ lat: propInitialLat, lng: propInitialLng, label: '' }]
   })
 
@@ -139,8 +158,9 @@ function LocationPicker({ onConfirm, onCancel, initialLat: propInitialLat = 25.0
         hasValidParsedLocation = parsedLocations.length > 0
       }
       
-      // 只有在沒有 lastLocation 且沒有成功解析座標時，才使用配置的位置
-      if (!lastLocation && !hasValidParsedLocation) {
+      // 優先順序：initialText 坐標 > lastLocation > 配置位置
+      // 只有在沒有 initialText 坐標且沒有 lastLocation 時，才使用配置的位置
+      if (!hasValidParsedLocation && !lastLocation) {
         setLocations([{ lat: initialLat, lng: initialLng, label: '' }])
       }
       setLocationsInitialized(true)
@@ -251,6 +271,16 @@ function LocationPicker({ onConfirm, onCancel, initialLat: propInitialLat = 25.0
     )
     
     map.current.on('load', () => {
+      // 如果有多個位置，調整視圖以顯示所有點
+      if (locations.length > 1) {
+        const bounds = calculateBounds(locations)
+        if (bounds) {
+          map.current.fitBounds(bounds, {
+            padding: { top: 50, bottom: 50, left: 50, right: 50 },
+            maxZoom: 15
+          })
+        }
+      }
       setLocations([...locations])
     })
 

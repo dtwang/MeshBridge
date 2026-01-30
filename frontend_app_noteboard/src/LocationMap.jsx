@@ -1,17 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
-import mapInstanceManager from './MapInstanceManager'
+import mapInstanceManager, { isMobileLayout, needsWebGLControl } from './MapInstanceManager'
+import staticMapRenderer from './StaticMapRenderer'
 
 let componentIdCounter = 0
-
-function isMobileLayout() {
-  return window.innerWidth <= 768
-}
-
-function needsWebGLControl() {
-  return isMobileLayout()
-}
 
 function LocationMap({ lat, lng, locations, zoom = 14 }) {
   const mapContainer = useRef(null)
@@ -25,6 +18,28 @@ function LocationMap({ lat, lng, locations, zoom = 14 }) {
   const componentId = useRef(`location-map-${++componentIdCounter}`)
   const observerRef = useRef(null)
   const needsControl = useRef(needsWebGLControl())
+  const isMobile = useRef(isMobileLayout())
+  const [staticImageUrl, setStaticImageUrl] = useState(null)
+  const [isInteractive, setIsInteractive] = useState(false)
+  const [isLoadingImage, setIsLoadingImage] = useState(true)
+  const revertToStaticCallback = useRef(null)
+
+  useEffect(() => {
+    // 桌機版：註冊回調函數，用於恢復成靜態圖
+    if (!isMobile.current) {
+      revertToStaticCallback.current = () => {
+        setIsInteractive(false)
+        setCanRenderMap(false)
+      }
+      mapInstanceManager.registerDesktopCallback(componentId.current, revertToStaticCallback.current)
+    }
+
+    return () => {
+      if (!isMobile.current) {
+        mapInstanceManager.unregisterDesktopCallback(componentId.current)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     // 不需要 WebGL 控制的設備：跳過 Intersection Observer
@@ -101,14 +116,36 @@ function LocationMap({ lat, lng, locations, zoom = 14 }) {
   }, [])
 
   useEffect(() => {
+    // 桌機版：生成靜態圖片
+    if (!isMobile.current && mapEnabled && !isInteractive) {
+      const locationsList = locations || (lat !== undefined && lng !== undefined ? [{ lat, lng }] : [])
+      if (locationsList.length === 0) return
+
+      setIsLoadingImage(true)
+      staticMapRenderer.renderMapToImage(locationsList, zoom, mapContainer.current).then(imageUrl => {
+        if (imageUrl) {
+          setStaticImageUrl(imageUrl)
+        }
+        setIsLoadingImage(false)
+      })
+    }
+  }, [lat, lng, locations, zoom, mapEnabled, isInteractive])
+
+  useEffect(() => {
     const requestMapInstance = async () => {
-      // 不需要 WebGL 控制的設備：直接允許渲染
+      // 桌機版：不自動渲染 WebGL，等待用戶點擊
+      if (!isMobile.current && !isInteractive) {
+        setCanRenderMap(false)
+        return
+      }
+
+      // 手機版：不需要 WebGL 控制的設備，直接允許渲染
       if (!needsControl.current) {
         setCanRenderMap(true)
         return
       }
 
-      // 需要 WebGL 控制的設備（Android Chrome / iOS Safari）：檢查可見性並請求實例
+      // 手機版：需要 WebGL 控制的設備（Android Chrome / iOS Safari）：檢查可見性並請求實例
       if (!isVisible) {
         setCanRenderMap(false)
         return
@@ -119,7 +156,7 @@ function LocationMap({ lat, lng, locations, zoom = 14 }) {
     }
 
     requestMapInstance()
-  }, [isVisible])
+  }, [isVisible, isInteractive])
 
   useEffect(() => {
     if (map.current) return
@@ -228,8 +265,12 @@ function LocationMap({ lat, lng, locations, zoom = 14 }) {
         mapInstanceManager.releaseInstance(componentId.current)
         setCanRenderMap(false)
       }
+      // 桌機版：釋放互動地圖實例
+      if (!isMobile.current && isInteractive) {
+        mapInstanceManager.releaseInstance(componentId.current)
+      }
     }
-  }, [zoomLimits, canRenderMap])
+  }, [zoomLimits, canRenderMap, isInteractive])
 
   useEffect(() => {
     if (!map.current) return
@@ -318,10 +359,88 @@ function LocationMap({ lat, lng, locations, zoom = 14 }) {
     )
   }
 
+  const handleStaticImageClick = () => {
+    if (!isMobile.current && !isInteractive) {
+      mapInstanceManager.requestDesktopInteractiveMap(componentId.current)
+      setIsInteractive(true)
+    }
+  }
+
   if (!canRenderMap) {
     const locationsList = locations || (lat !== undefined && lng !== undefined ? [{ lat, lng }] : [])
     const firstLocation = locationsList[0] || { lat: 0, lng: 0 }
     
+    // 桌機版：顯示靜態圖片
+    if (!isMobile.current && staticImageUrl) {
+      return (
+        <div 
+          ref={mapContainer}
+          onClick={handleStaticImageClick}
+          style={{ 
+            width: '98%', 
+            margin: '0 auto',
+            boxShadow: '0 4px 8px rgba(0,0,0,0.2)',
+            height: '240px',
+            borderRadius: '8px',
+            overflow: 'hidden',
+            cursor: 'pointer',
+            position: 'relative'
+          }}
+        >
+          <img 
+            src={staticImageUrl} 
+            alt="Map preview"
+            className="map-preview-fade-in"
+            style={{ 
+              width: '100%', 
+              height: '100%', 
+              objectFit: 'cover',
+              display: 'block'
+            }}
+          />
+          <div style={{
+            position: 'absolute',
+            bottom: '8px',
+            right: '8px',
+            backgroundColor: 'rgba(255, 255, 255, 0.9)',
+            padding: '4px 8px',
+            borderRadius: '4px',
+            fontSize: '11px',
+            color: '#666',
+            boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
+          }}>
+            點擊以互動
+          </div>
+        </div>
+      )
+    }
+
+    // 桌機版：載入中
+    if (!isMobile.current && isLoadingImage) {
+      return (
+        <div 
+          ref={mapContainer}
+          style={{ 
+            width: '98%', 
+            margin: '0 auto',
+            boxShadow: '0 4px 8px rgba(0,0,0,0.2)',
+            height: '240px',
+            borderRadius: '8px',
+            overflow: 'hidden',
+            backgroundColor: '#f0f0f0',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: '#999',
+            fontSize: '14px'
+          }}
+        >
+          載入地圖預覽...
+        </div>
+      )
+    }
+    
+    // 手機版：顯示座標
     return (
       <div 
         ref={mapContainer}
