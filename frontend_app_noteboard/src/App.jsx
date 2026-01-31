@@ -109,6 +109,9 @@ function App() {
   const [mapEnabled, setMapEnabled] = useState(false)
   const [filterInputReadonly, setFilterInputReadonly] = useState(true)
   const filterInputRef = useRef(null)
+  const [isSubmittingDraft, setIsSubmittingDraft] = useState(false)
+  const [isSubmittingReply, setIsSubmittingReply] = useState(false)
+  const [isSubmittingEdit, setIsSubmittingEdit] = useState(false)
 
   useEffect(() => {
     const fetchUserLastLocation = async () => {
@@ -645,6 +648,11 @@ function App() {
       return
     }
 
+    if (isSubmittingReply) {
+      return
+    }
+
+    setIsSubmittingReply(true)
     try {
       const response = await fetch(`/api/boards/${boardId}/notes`, {
         method: 'POST',
@@ -677,6 +685,8 @@ function App() {
     } catch (error) {
       console.error('Failed to create reply:', error)
       showAlert('張貼回覆失敗：' + error.message, '錯誤')
+    } finally {
+      setIsSubmittingReply(false)
     }
   }
 
@@ -705,6 +715,11 @@ function App() {
       return
     }
 
+    if (isSubmittingDraft) {
+      return
+    }
+
+    setIsSubmittingDraft(true)
     try {
       const response = await fetch(`/api/boards/${boardId}/notes`, {
         method: 'POST',
@@ -736,6 +751,8 @@ function App() {
     } catch (error) {
       console.error('Failed to create note:', error)
       showAlert('建立便利貼失敗：' + error.message, '錯誤')
+    } finally {
+      setIsSubmittingDraft(false)
     }
   }
 
@@ -761,6 +778,11 @@ function App() {
       return
     }
 
+    if (isSubmittingEdit) {
+      return
+    }
+
+    setIsSubmittingEdit(true)
     try {
       const response = await fetch(`/api/boards/${boardId}/notes/${noteId}`, {
         method: 'PUT',
@@ -786,6 +808,8 @@ function App() {
     } catch (error) {
       console.error('Failed to update note:', error)
       showAlert('更新便利貼失敗：' + error.message, '錯誤')
+    } finally {
+      setIsSubmittingEdit(false)
     }
   }
 
@@ -1273,7 +1297,7 @@ function App() {
           </div>
           <div className="draft-actions">
             <button className="btn-cancel" onClick={handleCancelEdit}>取消</button>
-            <button className="btn-submit" onClick={() => handleSubmitEdit(data.noteId)}>更新</button>
+            <button className="btn-submit" onClick={() => handleSubmitEdit(data.noteId)} disabled={isSubmittingEdit}>更新</button>
           </div>
         </div>
       )
@@ -1475,7 +1499,7 @@ function App() {
           <div className="note-actions">
             <button className="btn-delete" onClick={() => handleDeleteNote(data.noteId, false)}>🗑️</button>
             <button className="btn-color" onClick={() => handleOpenColorPicker(data)}>🎨</button>
-            {isAdmin && !isReply && !data.replyLoraMessageId && !data.isTempParentNote && !data.archived && !data.isPinedNote && (
+            {isAdmin && !isReply && !data.replyLoraMessageId && !data.isTempParentNote && !data.archived && !data.isPinedNote && data.status !== 'Sending' && (
               <button className="btn-pin" onClick={() => handlePinNote(data.noteId)}>📌</button>
             )}
           </div>
@@ -1484,7 +1508,7 @@ function App() {
           <div className="note-actions">
             <button className="btn-delete" onClick={() => handleDeleteNote(data.noteId, false, senderID)}>🗑️</button>
             <button className="btn-color" onClick={() => handleOpenColorPicker(data)}>🎨</button>
-            {!isReply && !data.replyLoraMessageId && !data.isTempParentNote && !data.isPinedNote && (
+            {!isReply && !data.replyLoraMessageId && !data.isTempParentNote && !data.isPinedNote && data.status !== 'Sending' && (
               <button className="btn-pin" onClick={() => handlePinNote(data.noteId)}>📌</button>
             )}
           </div>
@@ -1587,7 +1611,7 @@ function App() {
               )}
               <div className="draft-actions">
                 <button className="btn-cancel" onClick={handleCancelReply}>取消</button>
-                <button className="btn-submit" onClick={handleSubmitReply}>送出</button>
+                <button className="btn-submit" onClick={handleSubmitReply} disabled={isSubmittingReply}>送出</button>
               </div>
             </div>
           </div>
@@ -1765,7 +1789,7 @@ function App() {
               )}
               <div className="draft-actions">
                 <button className="btn-cancel" onClick={handleCancelDraft}>取消</button>
-                <button className="btn-submit" onClick={handleSubmitDraft}>送出</button>
+                <button className="btn-submit" onClick={handleSubmitDraft} disabled={isSubmittingDraft}>送出</button>
               </div>
             </div>
           )}
@@ -1780,7 +1804,7 @@ function App() {
 
       <footer className="app-footer">
         <div className="footer-left">uid={myUUID}</div>
-        <div className="footer-right">MeshNoteboard v0.3.2</div>
+        <div className="footer-right">MeshNoteboard v0.4.0</div>
       </footer>
 
       {modalConfig.show && (
