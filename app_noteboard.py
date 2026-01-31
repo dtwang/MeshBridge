@@ -98,6 +98,7 @@ current_dev_path = None
 lora_connected = False
 channel_validated = False
 pending_ack = {}
+FLAG_DEVICE_WAITING_ACK = False
 send_interval = max(SEND_INTERVAL_SECOND, 10)
 deviceLastPosition = {'lat': 0.0, 'lng': 0.0}
 isDeviceProvideLocation = False
@@ -817,7 +818,7 @@ def send_ack_delayed(lora_msg_id, interface_obj, channel_name, retry_count=0, ma
             print(f"  -> 已達最大重試次數，放棄發送 ACK 命令")
 
 def onReceive(packet, interface):
-    global pending_ack
+    global pending_ack, FLAG_DEVICE_WAITING_ACK
     try:
         if 'decoded' in packet and packet['decoded'].get('portnum') == 'ROUTING_APP':
             request_id = packet['decoded'].get('requestId')
@@ -827,37 +828,17 @@ def onReceive(packet, interface):
                 lora_msg_id = str(request_id)
                 print(f"[收到 ACK] request_id={request_id}, lora_msg_id={ack_packet_id}")
                 
+                FLAG_DEVICE_WAITING_ACK = False
+                
                 if update_note_status(note_info['note_id'], 'LoRa sent'):
                     print(f"  -> 已更新 note {note_info['note_id']} 狀態為 'LoRa sent'")
                     
                     try:
                         update_note_lora_msg_id(note_info['note_id'], lora_msg_id)
                         print(f"  -> 已儲存 lora_msg_id: {lora_msg_id} (使用 request_id)")
-                        
-                        def send_author_and_color():
-                            try:
-                                author_cmd = f"/author [{lora_msg_id}]{note_info['author_key']}"
-                                interface.sendText(author_cmd, channelIndex=get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME))
-                                print(f"  -> [延遲 5 秒後] 已發送 author 命令: {author_cmd}")
-                                
-                                def send_color():
-                                    try:
-                                        color_index = get_color_index_from_palette(note_info['bg_color'])
-                                        color_cmd = f"/color [{lora_msg_id}]{note_info['author_key']}, {color_index}"
-                                        interface.sendText(color_cmd, channelIndex=get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME))
-                                        print(f"  -> [延遲 10 秒後] 已發送 color 命令: {color_cmd}")
-                                    except Exception as e:
-                                        print(f"  -> [延遲 10 秒後] 發送 color 命令失敗: {e}")
-                                
-                                eventlet.spawn_after(5, send_color)
-                                print(f"  -> 已排程在 5 秒後發送 color 命令")
-                            except Exception as e:
-                                print(f"  -> [延遲 5 秒後] 發送 author 命令失敗: {e}")
-                        
-                        eventlet.spawn_after(5, send_author_and_color)
-                        print(f"  -> 已排程在 5 秒後發送 author 和 color 命令")
+                        print(f"  -> color_id 與 author_key 已在訊息中一併發送")
                     except Exception as e:
-                        print(f"  -> 發送後續命令失敗: {e}")
+                        print(f"  -> 更新 lora_msg_id 失敗: {e}")
                     
                     socketio.emit('refresh_notes', {'board_id': BOARD_MESSAGE_CHANEL_NAME})
                 
@@ -904,7 +885,35 @@ def onReceive(packet, interface):
             
             should_refresh = False
             
-            if msg.startswith('/msg [new]'):
+            if msg.startswith('/msg [new,') and ']' in msg:
+                # 新格式: /msg [new,color_id,author_key]body
+                end_bracket = msg.index(']')
+                params = msg[10:end_bracket]
+                body = msg[end_bracket + 1:]
+                parts = params.split(',')
+                
+                if len(parts) == 2:
+                    color_id = parts[0].strip()
+                    author_key = parts[1].strip()
+                    print(f"[新訊息 with params] lora_msg_id={lora_msg_id}, color_id={color_id}, author_key={author_key}, body={body}")
+                    
+                    bg_color = get_color_from_palette(int(color_id)) if color_id.isdigit() else ''
+                    
+                    if save_lora_note(
+                        lora_msg_id=lora_msg_id,
+                        board_id=BOARD_MESSAGE_CHANEL_NAME,
+                        body=body,
+                        bg_color=bg_color,
+                        author_key=author_key,
+                        lora_node_id=lora_uuid
+                    ):
+                        should_refresh = True
+                        print(f"  -> 已儲存訊息 (含 color_id={color_id}, author_key={author_key})，將在 60 秒後發送 USER ACK 命令")
+                        eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                else:
+                    print(f"  -> 格式錯誤，應為 /msg [new,color_id,author_key]body")
+                    
+            elif msg.startswith('/msg [new]'):
                 body = msg[10:]
                 print(f"[新訊息] lora_msg_id={lora_msg_id}, body={body}")
                 if save_lora_note(
@@ -921,42 +930,91 @@ def onReceive(packet, interface):
                     
             elif msg.startswith('/msg [') and ']' in msg:
                 end_bracket = msg.index(']')
-                resend_lora_msg_id = msg[6:end_bracket]
+                bracket_content = msg[6:end_bracket]
                 body = msg[end_bracket + 1:]
-                print(f"[重發訊息] lora_msg_id={resend_lora_msg_id}, body={body}")
                 
-                if not lora_msg_id_exists(resend_lora_msg_id):
-                    if save_lora_note(
-                        lora_msg_id=resend_lora_msg_id,
-                        board_id=BOARD_MESSAGE_CHANEL_NAME,
-                        body=body,
-                        bg_color='',
-                        author_key='',
-                        lora_node_id=lora_uuid
-                    ):
-                        should_refresh = True
-                        print(f"[重發訊息寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
-                        print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
-                        eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
-                        # 更新以此訊息為父訊息的回覆，將 is_temp_parent_note 設為 0
-                        try:
-                            conn = sqlite3.connect(DB_PATH)
-                            cursor = conn.cursor()
-                            cursor.execute('''
-                                UPDATE notes SET is_temp_parent_note = 0
-                                WHERE reply_lora_msg_id = ? AND is_temp_parent_note = 1
-                            ''', (resend_lora_msg_id,))
-                            updated_count = cursor.rowcount
-                            conn.commit()
-                            conn.close()
-                            if updated_count > 0:
-                                print(f"  -> 已更新 {updated_count} 筆回覆的 is_temp_parent_note 為 0")
-                        except Exception as e:
-                            print(f"  -> 更新 is_temp_parent_note 失敗: {e}")
+                # 檢查是否為新格式: /msg [lora_msg_id,color_id,author_key]body
+                if ',' in bracket_content:
+                    parts = bracket_content.split(',')
+                    if len(parts) == 3:
+                        resend_lora_msg_id = parts[0].strip()
+                        color_id = parts[1].strip()
+                        author_key = parts[2].strip()
+                        print(f"[重發訊息 with params] lora_msg_id={resend_lora_msg_id}, color_id={color_id}, author_key={author_key}, body={body}")
+                        
+                        bg_color = get_color_from_palette(int(color_id)) if color_id.isdigit() else ''
+                        
+                        if not lora_msg_id_exists(resend_lora_msg_id):
+                            if save_lora_note(
+                                lora_msg_id=resend_lora_msg_id,
+                                board_id=BOARD_MESSAGE_CHANEL_NAME,
+                                body=body,
+                                bg_color=bg_color,
+                                author_key=author_key,
+                                lora_node_id=lora_uuid
+                            ):
+                                should_refresh = True
+                                print(f"[重發訊息寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
+                                print(f"  -> 已儲存訊息 (含 color_id={color_id}, author_key={author_key})，將在 60 秒後發送 USER ACK 命令")
+                                eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                                # 更新以此訊息為父訊息的回覆，將 is_temp_parent_note 設為 0
+                                try:
+                                    conn = sqlite3.connect(DB_PATH)
+                                    cursor = conn.cursor()
+                                    cursor.execute('''
+                                        UPDATE notes SET is_temp_parent_note = 0
+                                        WHERE reply_lora_msg_id = ? AND is_temp_parent_note = 1
+                                    ''', (resend_lora_msg_id,))
+                                    updated_count = cursor.rowcount
+                                    conn.commit()
+                                    conn.close()
+                                    if updated_count > 0:
+                                        print(f"  -> 已更新 {updated_count} 筆回覆的 is_temp_parent_note 為 0")
+                                except Exception as e:
+                                    print(f"  -> 更新 is_temp_parent_note 失敗: {e}")
+                        else:
+                            print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過建立資料")
+                            print(f"  -> 但仍將在 60 秒後發送 USER ACK 命令")
+                            eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                    else:
+                        print(f"  -> 格式錯誤，應為 /msg [lora_msg_id,color_id,author_key]body")
                 else:
-                    print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過建立資料")
-                    print(f"  -> 但仍將在 60 秒後發送 USER ACK 命令")
-                    eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                    # 原本格式: /msg [lora_msg_id]body
+                    resend_lora_msg_id = bracket_content
+                    print(f"[重發訊息] lora_msg_id={resend_lora_msg_id}, body={body}")
+                    
+                    if not lora_msg_id_exists(resend_lora_msg_id):
+                        if save_lora_note(
+                            lora_msg_id=resend_lora_msg_id,
+                            board_id=BOARD_MESSAGE_CHANEL_NAME,
+                            body=body,
+                            bg_color='',
+                            author_key='',
+                            lora_node_id=lora_uuid
+                        ):
+                            should_refresh = True
+                            print(f"[重發訊息寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
+                            print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
+                            eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                            # 更新以此訊息為父訊息的回覆，將 is_temp_parent_note 設為 0
+                            try:
+                                conn = sqlite3.connect(DB_PATH)
+                                cursor = conn.cursor()
+                                cursor.execute('''
+                                    UPDATE notes SET is_temp_parent_note = 0
+                                    WHERE reply_lora_msg_id = ? AND is_temp_parent_note = 1
+                                ''', (resend_lora_msg_id,))
+                                updated_count = cursor.rowcount
+                                conn.commit()
+                                conn.close()
+                                if updated_count > 0:
+                                    print(f"  -> 已更新 {updated_count} 筆回覆的 is_temp_parent_note 為 0")
+                            except Exception as e:
+                                print(f"  -> 更新 is_temp_parent_note 失敗: {e}")
+                    else:
+                        print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過建立資料")
+                        print(f"  -> 但仍將在 60 秒後發送 USER ACK 命令")
+                        eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
                     
             elif msg.startswith('/color [') and ']' in msg:
                 end_bracket = msg.index(']')
@@ -1030,6 +1088,59 @@ def onReceive(packet, interface):
                     else:
                         print(f"  -> 處理 USER ACK 失敗")
                     
+            elif msg.startswith('/reply <new,') and ']' in msg:
+                # 新格式: /reply <new,color_id,author_key>[parent_lora_msg_id]body
+                angle_start = msg.index('<') + 1
+                angle_end = msg.index('>')
+                angle_content = msg[angle_start:angle_end]
+                parts = angle_content.split(',')
+                
+                if len(parts) == 3 and msg[angle_end + 1] == '[':
+                    color_id = parts[1].strip()
+                    author_key = parts[2].strip()
+                    
+                    start_bracket = angle_end + 1
+                    end_bracket = msg.index(']', start_bracket)
+                    parent_lora_msg_id = msg[start_bracket + 1:end_bracket]
+                    body = msg[end_bracket + 1:]
+                    print(f"[新回覆訊息 with params] parent_lora_msg_id={parent_lora_msg_id}, color_id={color_id}, author_key={author_key}, body={body}")
+                    
+                    is_temp_parent = 0
+                    
+                    if lora_msg_id_exists(parent_lora_msg_id):
+                        reply_lora_msg_id = parent_lora_msg_id
+                        print(f"  -> 找到父訊息 lora_msg_id: {parent_lora_msg_id}")
+                    else:
+                        reply_lora_msg_id = parent_lora_msg_id
+                        is_temp_parent = 1
+                        print(f"  -> 父訊息 lora_msg_id {parent_lora_msg_id} 不存在本機，仍將 reply_lora_msg_id 設為 {parent_lora_msg_id}，並設定 is_temp_parent_note=1")
+                    
+                    bg_color = get_color_from_palette(int(color_id)) if color_id.isdigit() else ''
+                    
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        cursor = conn.cursor()
+                        timestamp = int(time.time() * 1000)
+                        status = 'LoRa received'
+                        reply_note_id = generate_note_id()
+                        
+                        cursor.execute('''
+                            INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
+                                             created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, lora_node_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
+                        ''', (reply_note_id, reply_lora_msg_id, BOARD_MESSAGE_CHANEL_NAME, body, bg_color, status, 
+                              timestamp, timestamp, author_key, lora_msg_id, is_temp_parent, lora_uuid))
+                        
+                        conn.commit()
+                        conn.close()
+                        should_refresh = True
+                        print(f"  -> 成功儲存回覆訊息 (含 color_id={color_id}, author_key={author_key})，將在 60 秒後發送 USER ACK 命令")
+                        eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                    except Exception as e:
+                        print(f"  -> 儲存回覆訊息失敗: {e}")
+                else:
+                    print(f"  -> 格式錯誤，應為 /reply <new,color_id,author_key>[parent_lora_msg_id]body")
+                    
             elif msg.startswith('/reply <new>[') and ']' in msg:
                 end_bracket = msg.index(']', 13)
                 parent_lora_msg_id = msg[13:end_bracket]
@@ -1070,10 +1181,9 @@ def onReceive(packet, interface):
                     
             elif msg.startswith('/reply <') and '>[' in msg and ']' in msg:
                 # 重發回覆格式: /reply <resend_lora_msg_id>[parent_lora_msg_id]body
-                # resend_lora_msg_id 是這則回覆的 lora_msg_id
-                # parent_lora_msg_id 是父訊息的 lora_msg_id
+                # 或新格式: /reply <resend_lora_msg_id,color_id,author_key>[parent_lora_msg_id]body
                 end_angle = msg.index('>')
-                resend_lora_msg_id = msg[8:end_angle]  # <xxxx> 中的值作為此回覆的 lora_msg_id
+                angle_content = msg[8:end_angle]
                 
                 start_bracket = end_angle + 1
                 if msg[start_bracket] != '[':
@@ -1082,57 +1192,123 @@ def onReceive(packet, interface):
                     end_bracket = msg.index(']', start_bracket)
                     parent_lora_msg_id = msg[start_bracket + 1:end_bracket]
                     body = msg[end_bracket + 1:]
-                    print(f"[重發回覆訊息] resend_lora_msg_id={resend_lora_msg_id}, parent_lora_msg_id={parent_lora_msg_id}, body={body}")
                     
-                    # 檢查此回覆是否已存在
-                    if not lora_msg_id_exists(resend_lora_msg_id):
-                        is_temp_parent = 0
-                        
-                        if lora_msg_id_exists(parent_lora_msg_id):
-                            reply_lora_msg_id = parent_lora_msg_id
-                            print(f"  -> 找到父訊息 lora_msg_id: {parent_lora_msg_id}")
+                    # 檢查是否為新格式: /reply <resend_lora_msg_id,color_id,author_key>[parent_lora_msg_id]body
+                    if ',' in angle_content:
+                        parts = angle_content.split(',')
+                        if len(parts) == 3:
+                            resend_lora_msg_id = parts[0].strip()
+                            color_id = parts[1].strip()
+                            author_key = parts[2].strip()
+                            print(f"[重發回覆訊息 with params] resend_lora_msg_id={resend_lora_msg_id}, parent_lora_msg_id={parent_lora_msg_id}, color_id={color_id}, author_key={author_key}, body={body}")
+                            
+                            bg_color = get_color_from_palette(int(color_id)) if color_id.isdigit() else ''
+                            
+                            # 檢查此回覆是否已存在
+                            if not lora_msg_id_exists(resend_lora_msg_id):
+                                is_temp_parent = 0
+                                
+                                if lora_msg_id_exists(parent_lora_msg_id):
+                                    reply_lora_msg_id = parent_lora_msg_id
+                                    print(f"  -> 找到父訊息 lora_msg_id: {parent_lora_msg_id}")
+                                else:
+                                    reply_lora_msg_id = parent_lora_msg_id
+                                    is_temp_parent = 1
+                                    print(f"  -> 父訊息 lora_msg_id {parent_lora_msg_id} 不存在本機，仍將 reply_lora_msg_id 設為 {parent_lora_msg_id}，並設定 is_temp_parent_note=1")
+                                
+                                try:
+                                    conn = sqlite3.connect(DB_PATH)
+                                    cursor = conn.cursor()
+                                    timestamp = int(time.time() * 1000)
+                                    status = 'LoRa received'
+                                    reply_note_id = generate_note_id()
+                                    
+                                    cursor.execute('''
+                                        INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
+                                                         created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, lora_node_id)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
+                                    ''', (reply_note_id, reply_lora_msg_id, BOARD_MESSAGE_CHANEL_NAME, body, bg_color, status, 
+                                          timestamp, timestamp, author_key, resend_lora_msg_id, is_temp_parent, lora_uuid))
+                                    
+                                    conn.commit()
+                                    
+                                    # 更新以此回覆為父訊息的其他回覆，將 is_temp_parent_note 設為 0
+                                    cursor.execute('''
+                                        UPDATE notes SET is_temp_parent_note = 0
+                                        WHERE reply_lora_msg_id = ? AND is_temp_parent_note = 1
+                                    ''', (resend_lora_msg_id,))
+                                    updated_count = cursor.rowcount
+                                    conn.commit()
+                                    conn.close()
+                                    
+                                    should_refresh = True
+                                    print(f"[重發回覆寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
+                                    print(f"  -> 已儲存訊息 (含 color_id={color_id}, author_key={author_key})，將在 60 秒後發送 USER ACK 命令")
+                                    eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                                    if updated_count > 0:
+                                        print(f"  -> 已更新 {updated_count} 筆回覆的 is_temp_parent_note 為 0")
+                                except Exception as e:
+                                    print(f"  -> 儲存重發回覆訊息失敗: {e}")
+                            else:
+                                print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過建立資料")
+                                print(f"  -> 但仍將在 60 秒後發送 USER ACK 命令")
+                                eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
                         else:
-                            reply_lora_msg_id = parent_lora_msg_id
-                            is_temp_parent = 1
-                            print(f"  -> 父訊息 lora_msg_id {parent_lora_msg_id} 不存在本機，仍將 reply_lora_msg_id 設為 {parent_lora_msg_id}，並設定 is_temp_parent_note=1")
-                        
-                        try:
-                            conn = sqlite3.connect(DB_PATH)
-                            cursor = conn.cursor()
-                            timestamp = int(time.time() * 1000)
-                            status = 'LoRa received'
-                            reply_note_id = generate_note_id()
-                            
-                            cursor.execute('''
-                                INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
-                                                 created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, lora_node_id)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
-                            ''', (reply_note_id, reply_lora_msg_id, BOARD_MESSAGE_CHANEL_NAME, body, '', status, 
-                                  timestamp, timestamp, '', resend_lora_msg_id, is_temp_parent, lora_uuid))
-                            
-                            conn.commit()
-                            
-                            # 更新以此回覆為父訊息的其他回覆，將 is_temp_parent_note 設為 0
-                            cursor.execute('''
-                                UPDATE notes SET is_temp_parent_note = 0
-                                WHERE reply_lora_msg_id = ? AND is_temp_parent_note = 1
-                            ''', (resend_lora_msg_id,))
-                            updated_count = cursor.rowcount
-                            conn.commit()
-                            conn.close()
-                            
-                            should_refresh = True
-                            print(f"[重發回覆寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
-                            print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
-                            eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
-                            if updated_count > 0:
-                                print(f"  -> 已更新 {updated_count} 筆回覆的 is_temp_parent_note 為 0")
-                        except Exception as e:
-                            print(f"  -> 儲存重發回覆訊息失敗: {e}")
+                            print(f"  -> 格式錯誤，應為 /reply <lora_msg_id,color_id,author_key>[parent_lora_msg_id]body")
                     else:
-                        print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過建立資料")
-                        print(f"  -> 但仍將在 60 秒後發送 USER ACK 命令")
-                        eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                        # 原本格式: /reply <resend_lora_msg_id>[parent_lora_msg_id]body
+                        resend_lora_msg_id = angle_content
+                        print(f"[重發回覆訊息] resend_lora_msg_id={resend_lora_msg_id}, parent_lora_msg_id={parent_lora_msg_id}, body={body}")
+                        
+                        # 檢查此回覆是否已存在
+                        if not lora_msg_id_exists(resend_lora_msg_id):
+                            is_temp_parent = 0
+                            
+                            if lora_msg_id_exists(parent_lora_msg_id):
+                                reply_lora_msg_id = parent_lora_msg_id
+                                print(f"  -> 找到父訊息 lora_msg_id: {parent_lora_msg_id}")
+                            else:
+                                reply_lora_msg_id = parent_lora_msg_id
+                                is_temp_parent = 1
+                                print(f"  -> 父訊息 lora_msg_id {parent_lora_msg_id} 不存在本機，仍將 reply_lora_msg_id 設為 {parent_lora_msg_id}，並設定 is_temp_parent_note=1")
+                            
+                            try:
+                                conn = sqlite3.connect(DB_PATH)
+                                cursor = conn.cursor()
+                                timestamp = int(time.time() * 1000)
+                                status = 'LoRa received'
+                                reply_note_id = generate_note_id()
+                                
+                                cursor.execute('''
+                                    INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
+                                                     created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, lora_node_id)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
+                                ''', (reply_note_id, reply_lora_msg_id, BOARD_MESSAGE_CHANEL_NAME, body, '', status, 
+                                      timestamp, timestamp, '', resend_lora_msg_id, is_temp_parent, lora_uuid))
+                                
+                                conn.commit()
+                                
+                                # 更新以此回覆為父訊息的其他回覆，將 is_temp_parent_note 設為 0
+                                cursor.execute('''
+                                    UPDATE notes SET is_temp_parent_note = 0
+                                    WHERE reply_lora_msg_id = ? AND is_temp_parent_note = 1
+                                ''', (resend_lora_msg_id,))
+                                updated_count = cursor.rowcount
+                                conn.commit()
+                                conn.close()
+                                
+                                should_refresh = True
+                                print(f"[重發回覆寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
+                                print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
+                                eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                                if updated_count > 0:
+                                    print(f"  -> 已更新 {updated_count} 筆回覆的 is_temp_parent_note 為 0")
+                            except Exception as e:
+                                print(f"  -> 儲存重發回覆訊息失敗: {e}")
+                        else:
+                            print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過建立資料")
+                            print(f"  -> 但仍將在 60 秒後發送 USER ACK 命令")
+                            eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
                     
             else:
                 if not msg.startswith('/'):
@@ -1184,7 +1360,7 @@ def check_ack_timeout():
 
 def send_scheduler_loop():
     """定期發送 LAN only notes 和處理需要更新的 notes 的排程器"""
-    global interface, lora_connected, pending_ack
+    global interface, lora_connected, pending_ack, FLAG_DEVICE_WAITING_ACK
     print(f"啟動發送排程器 (間隔: {send_interval} 秒)...")
     
     while True:
@@ -1194,6 +1370,10 @@ def send_scheduler_loop():
             check_ack_timeout()
             
             if not interface or not lora_connected:
+                continue
+            
+            if FLAG_DEVICE_WAITING_ACK:
+                print(f"[排程器] LoRa 設備正在等待 ACK，跳過此次處理")
                 continue
             
             update_note = get_note_need_update_lora(BOARD_MESSAGE_CHANEL_NAME)
@@ -1246,14 +1426,19 @@ def send_scheduler_loop():
                 channel_index = get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME)
                 
                 reply_lora_msg_id = note.get('reply_lora_msg_id')
+                author_key = note.get('author_key', '')
+                bg_color = note.get('bg_color', '')
+                color_id = get_color_index_from_palette(bg_color)
+                
                 print(f"  -> reply_lora_msg_id 值: {reply_lora_msg_id} (type: {type(reply_lora_msg_id)})")
+                print(f"  -> author_key: {author_key}, color_id: {color_id}")
                 
                 if reply_lora_msg_id:
-                    msg = f"/reply <new>[{reply_lora_msg_id}]{note['body']}"
-                    print(f"  -> 使用 /reply 指令 (reply_lora_msg_id={reply_lora_msg_id})")
+                    msg = f"/reply <new,{color_id},{author_key}>[{reply_lora_msg_id}]{note['body']}"
+                    print(f"  -> 使用 /reply 指令 (含 color_id 與 author_key): {msg}")
                 else:
-                    msg = f"/msg [new]{note['body']}"
-                    print(f"  -> 使用 /msg 指令 (無 reply_lora_msg_id)")
+                    msg = f"/msg [new,{color_id},{author_key}]{note['body']}"
+                    print(f"  -> 使用 /msg 指令 (含 color_id 與 author_key): {msg}")
                 
                 result = interface.sendText(msg, channelIndex=channel_index, wantAck=True)
                 
@@ -1270,6 +1455,7 @@ def send_scheduler_loop():
                         update_note_status(note['note_id'], 'Sending')
                         print(f"  -> 已發送訊息，等待 ACK (request_id={request_id})")
                         socketio.emit('refresh_notes', {'board_id': BOARD_MESSAGE_CHANEL_NAME})
+                        FLAG_DEVICE_WAITING_ACK = True
                     else:
                         print(f"  -> 已發送訊息，但無 request_id")
                 else:
@@ -1329,7 +1515,7 @@ def validate_channel_name(interface):
         return (False, error_msg)
 
 def mesh_loop():
-    global interface, current_dev_path, lora_connected, channel_validated, deviceLastPosition, isDeviceProvideLocation
+    global interface, current_dev_path, lora_connected, channel_validated, deviceLastPosition, isDeviceProvideLocation, FLAG_DEVICE_WAITING_ACK
     print("啟動 Meshtastic 自動偵測與監聽 (NoteBoard 模式)...")
     
     while True:
@@ -1508,6 +1694,7 @@ def mesh_loop():
                     is_channel_valid, error_msg = validate_channel_name(interface)
                     
                     lora_connected = True
+                    FLAG_DEVICE_WAITING_ACK = False
                     socketio.emit('lora_status', {
                         'online': True, 
                         'channel_validated': is_channel_valid,
@@ -1523,6 +1710,7 @@ def mesh_loop():
                 
                 if not lora_connected:
                     lora_connected = True
+                    FLAG_DEVICE_WAITING_ACK = False
                     is_channel_valid, error_msg = validate_channel_name(interface)
                     socketio.emit('lora_status', {
                         'online': True, 
@@ -2413,7 +2601,14 @@ def delete_board_note(board_id, note_id):
 @app.route('/api/boards/<board_id>/notes/<note_id>/resend', methods=['POST'])
 def resend_board_note(board_id, note_id):
     """重新發送 note (僅限 status 為 LoRa sent 的 note)"""
-    global interface, lora_connected, pending_ack
+    global interface, lora_connected, pending_ack, FLAG_DEVICE_WAITING_ACK
+    
+    if FLAG_DEVICE_WAITING_ACK:
+        return jsonify({
+            'success': False,
+            'error': 'LoRa設備忙碌中'
+        }), 503
+    
     try:
         data = request.get_json() or {}
         author_key = data.get('author_key', 'user-unknown')
@@ -2504,42 +2699,34 @@ def resend_board_note(board_id, note_id):
         try:
             channel_index = get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME)
             
+            # 取得 color_id
+            color_id = get_color_index_from_palette(bg_color)
+            
             if reply_lora_msg_id:
-                # 是回覆，使用 /reply 指令
-                msg = f"/reply <{lora_msg_id}>[{reply_lora_msg_id}]{body}"
-                print(f"[重新發送] 使用 /reply 指令: {msg}")
+                # 是回覆，使用 /reply 指令 (含 color_id 與 author_key)
+                msg = f"/reply <{lora_msg_id},{color_id},{db_author_key}>[{reply_lora_msg_id}]{body}"
+                print(f"[重新發送] 使用 /reply 指令 (含 color_id 與 author_key): {msg}")
             else:
-                # 不是回覆，使用 /msg 指令
-                msg = f"/msg [{lora_msg_id}]{body}"
-                print(f"[重新發送] 使用 /msg 指令: {msg}")
+                # 不是回覆，使用 /msg 指令 (含 color_id 與 author_key)
+                msg = f"/msg [{lora_msg_id},{color_id},{db_author_key}]{body}"
+                print(f"[重新發送] 使用 /msg 指令 (含 color_id 與 author_key): {msg}")
             
             interface.sendText(msg, channelIndex=channel_index)
             print(f"  -> 已發送重新發送命令 (note_id={note_id}, resent_count={resent_count + 1})")
+            print(f"  -> color_id={color_id}, author_key={db_author_key} 已在訊息中一併發送")
             
-            # 延遲 5 秒後發送 author、color 和 pin 命令
-            def send_follow_up_commands():
-                try:
-                    # 發送 author 命令
-                    author_cmd = f"/author [{lora_msg_id}]{db_author_key}"
-                    interface.sendText(author_cmd, channelIndex=channel_index)
-                    print(f"  -> [延遲 5 秒後] 已發送 author 命令: {author_cmd}")
-                    
-                    # 發送 color 命令
-                    color_index = get_color_index_from_palette(bg_color)
-                    color_cmd = f"/color [{lora_msg_id}]{db_author_key}, {color_index}"
-                    interface.sendText(color_cmd, channelIndex=channel_index)
-                    print(f"  -> [延遲 5 秒後] 已發送 color 命令: {color_cmd}")
-                    
-                    # 如果該 note 有 is_pined_note = true，也發送 /pin 命令
-                    if is_pined_note == 1:
+            # 如果該 note 有 is_pined_note = true，延遲 5 秒後發送 /pin 命令
+            if is_pined_note == 1:
+                def send_pin_command():
+                    try:
                         pin_cmd = f"/pin [{lora_msg_id}]{db_author_key}"
                         interface.sendText(pin_cmd, channelIndex=channel_index)
                         print(f"  -> [延遲 5 秒後] 已發送 pin 命令: {pin_cmd}")
-                except Exception as e:
-                    print(f"  -> [延遲 5 秒後] 發送後續命令失敗: {e}")
-            
-            eventlet.spawn_after(5, send_follow_up_commands)
-            print(f"  -> 已排程在 5 秒後發送 author、color 和 pin 命令")
+                    except Exception as e:
+                        print(f"  -> [延遲 5 秒後] 發送 pin 命令失敗: {e}")
+                
+                eventlet.spawn_after(5, send_pin_command)
+                print(f"  -> 已排程在 5 秒後發送 pin 命令")
             
             socketio.emit('refresh_notes', {'board_id': board_id})
             

@@ -375,6 +375,25 @@ NoteBoard 使用特定格式的文字訊息在 Meshmatic LoRa 網路的Channel�
 
 ### 6.1 新增留言
 
+**格式**：`/msg [new,<color_id>,<author_key>]<留言內容>`
+
+**用途**：建立一則新的留言，並同時設定顏色與作者
+
+**範例**：
+```
+/msg [new,5,93ujak6o]這是一則測試留言
+```
+
+**說明**：
+- 一次性傳送留言內容、顏色和作者資訊，減少 LoRa 傳輸次數
+- `color_id` 範圍：0-15（對應 16 色調色盤）
+- `author_key` 格式：
+  - Web 用戶：8 字元隨機字串（例如：`93ujak6o`、`a1b2c3d4`）
+  - LoRa 用戶：`lora-` 前綴加上裝置 ID（例如：`lora-a1b2c3d4`）
+- 系統會自動產生 `lora_msg_id` 作為此留言的唯一識別碼
+
+
+#### 舊版不含顏色與作者
 **格式**：`/msg [new]<留言內容>`
 
 **用途**：建立一則新的留言
@@ -388,10 +407,29 @@ NoteBoard 使用特定格式的文字訊息在 Meshmatic LoRa 網路的Channel�
 - 系統會自動產生 `lora_msg_id` 作為此留言的唯一識別碼
 - 初始 `author_key` 和 `bg_color` 為空，需透過後續指令設定
 
+
 ---
 
 ### 6.2 重發留言
 
+**格式**：`/msg [<lora_msg_id>,<color_id>,<author_key>]<留言內容>`
+
+**用途**：重新發送已存在的留言，並同時設定顏色與作者
+
+**範例**：
+```
+/msg [1234567890,5,93ujak6o]這是重發的留言
+```
+
+**說明**：
+- 一次性傳送留言內容、顏色和作者資訊
+- 如果本地已存在該 `lora_msg_id`，則略過不重複建立
+- 適用於網路同步和重新廣播場景
+- `author_key` 格式：
+  - Web 用戶：8 字元隨機字串（例如：`93ujak6o`）
+  - LoRa 用戶：`lora-` 前綴加上裝置 ID（例如：`lora-a1b2c3d4`）
+
+#### 舊版不含顏色與作者
 **格式**：`/msg [<lora_msg_id>]<留言內容>`
 
 **用途**：重新發送已存在的留言（使用指定的 `lora_msg_id`）
@@ -419,8 +457,11 @@ NoteBoard 使用特定格式的文字訊息在 Meshmatic LoRa 網路的Channel�
 ```
 
 **說明**：
-- `author_key` 格式通常為 `lora-<device_id>` 或 `user-<uuid>`
+- `author_key` 格式：
+  - Web 用戶：8 字元隨機字串（例如：`93ujak6o`）
+  - LoRa 用戶：`lora-` 前綴加上裝置 ID（例如：`lora-a1b2c3d4`）
 - 此指令會更新指定留言的 `author_key` 欄位
+- **注意**：新版系統建議使用完整格式的 `/msg` 或 `/reply` 指令，一次性傳送所有資訊
 
 ---
 
@@ -443,6 +484,7 @@ NoteBoard 使用特定格式的文字訊息在 Meshmatic LoRa 網路的Channel�
   - 4: Green, 5: Teal, 6: Cyan, 7: Light Blue
   - 8: Blue, 9: Purple, 10: Magenta, 11: Pink
   - 12: Light Gray, 13: Gray, 14: Gold, 15: Coral
+- **注意**：新版系統建議使用完整格式的 `/msg` 或 `/reply` 指令，一次性傳送所有資訊
 
 ---
 
@@ -466,6 +508,26 @@ NoteBoard 使用特定格式的文字訊息在 Meshmatic LoRa 網路的Channel�
 
 ### 6.6 回覆留言
 
+**格式**：`/reply <new,<color_id>,<author_key>>[<parent_lora_msg_id>]<留言內容>`
+
+**用途**：建立一則回覆留言，並同時設定顏色與作者
+
+**範例**：
+```
+/reply <new,5,93ujak6o>[1234567890]這是對該留言的回覆
+```
+
+**說明**：
+- 一次性傳送回覆內容、顏色和作者資訊，減少 LoRa 傳輸次數
+- `parent_lora_msg_id` 為要回覆的父留言的 `lora_msg_id`
+- `color_id` 範圍：0-15（對應 16 色調色盤）
+- `author_key` 格式：
+  - Web 用戶：8 字元隨機字串（例如：`93ujak6o`）
+  - LoRa 用戶：`lora-` 前綴加上裝置 ID（例如：`lora-a1b2c3d4`）
+- 系統會自動產生此回覆的 `lora_msg_id`
+
+
+#### 舊版不含顏色和作者資訊
 **格式**：`/reply <new>[<parent_lora_msg_id>]<留言內容>`
 
 **用途**：建立一則回覆留言，關聯至指定的父留言
@@ -480,17 +542,40 @@ NoteBoard 使用特定格式的文字訊息在 Meshmatic LoRa 網路的Channel�
 - 如果父留言不存在於本地資料庫，系統會設定 `is_temp_parent_note=1`
 - 支援多層級回覆（回覆的回覆）
 
+---
+
 ### 6.7 重送回覆留言
 
+**格式**：`/reply <lora_msg_id,<color_id>,<author_key>>[<parent_lora_msg_id>]<留言內容>`
+
+**用途**：重新發送已存在的回覆留言，並同時設定顏色與作者
+
+**範例**：
+```
+/reply <0123456789,5,93ujak6o>[1234567890]這是對該留言的回覆
+```
+
+**說明**：
+- 一次性傳送回覆內容、顏色和作者資訊
+- 如果本地已存在該 `lora_msg_id`，則略過不重複建立
+- 適用於網路同步和重新廣播場景
+- `author_key` 格式：
+  - Web 用戶：8 字元隨機字串（例如：`93ujak6o`）
+  - LoRa 用戶：`lora-` 前綴加上裝置 ID（例如：`lora-a1b2c3d4`）
+
+#### 舊版不含顏色和作者
 **格式**：`/reply <lora_msg_id>[<parent_lora_msg_id>]<留言內容>`
 
-
-**用途**：重新發送已存在的留言（使用指定的 `lora_msg_id`），關聯至指定的父留言
+**用途**：重新發送已存在的回覆留言（使用指定的 `lora_msg_id`），關聯至指定的父留言
 
 **範例**：
 ```
 /reply <0123456789>[1234567890]這是對該留言的回覆
 ```
+
+**說明**：
+- 用於確保回覆留言在網路中的一致性
+- 如果本地已存在該 `lora_msg_id`，則略過不重複建立
 
 ---
 
@@ -514,11 +599,24 @@ NoteBoard 使用特定格式的文字訊息在 Meshmatic LoRa 網路的Channel�
 
 ### 指令發送流程
 
+#### 新版流程（v0.4.0+，推薦）
+1. **Web 端建立留言** → 儲存為 `LAN only` 狀態
+2. **排程器發送** → 透過 LoRa 發送 `/msg [new,color_id,author_key]` 指令（一次性傳送所有資訊）
+3. **接收 ACK** → 更新狀態為 `LoRa sent`，記錄 `lora_msg_id`
+4. **其他節點接收** → 解析指令並同步至本地資料庫（包含顏色和作者資訊）
+
+#### 舊版流程（v0.3.x 及更早版本）
 1. **Web 端建立留言** → 儲存為 `LAN only` 狀態
 2. **排程器發送** → 透過 LoRa 發送 `/msg [new]` 指令
 3. **接收 ACK** → 更新狀態為 `LoRa sent`，記錄 `lora_msg_id`
-4. **發送後續指令** → 自動發送 `/author` 和 `/color` 指令
+4. **發送後續指令** → 延遲 5-10 秒後自動發送 `/author` 和 `/color` 指令
 5. **其他節點接收** → 解析指令並同步至本地資料庫
+
+**新版優勢**：
+- 減少 LoRa 傳輸次數（從 3 次減少到 1 次）
+- 降低網路延遲和頻寬佔用
+- 提高資料一致性（避免部分指令遺失的問題）
+- 減少裝置等待 ACK 的時間，提升整體傳輸效率
 
 ## 7. SQLite 資料庫欄位說明
 
