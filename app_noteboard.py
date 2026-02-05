@@ -826,7 +826,22 @@ def onReceive(packet, interface):
                 note_info = pending_ack[request_id]
                 ack_packet_id = packet.get('id')
                 lora_msg_id = str(request_id)
-                print(f"[收到 ACK] request_id={request_id}, lora_msg_id={ack_packet_id}")
+                
+                # 取得 errorReason 作為日誌參考（不影響成功判斷）
+                routing = packet['decoded'].get('routing', {})
+                error_reason = None
+                if isinstance(routing, dict):
+                    error_reason = routing.get('errorReason')
+                elif hasattr(routing, 'errorReason'):
+                    error_reason = routing.errorReason
+                
+                # 收到 ROUTING_APP 回應就視為已發送（訊息已在 mesh 網路上）
+                # errorReason 只作為日誌參考，不影響成功判斷
+                # （MAX_RETRANSMIT 等只代表設備層級重傳超時，但訊息可能已成功傳播）
+                if error_reason and error_reason != 'NONE':
+                    print(f"[收到 設備與Mesh網路 ACK] request_id={request_id}, lora_msg_id={ack_packet_id} (設備回報: {error_reason}，但訊息已發送)")
+                else:
+                    print(f"[收到 設備與Mesh網路 ACK] request_id={request_id}, lora_msg_id={ack_packet_id}")
                 
                 FLAG_DEVICE_WAITING_ACK = False
                 
@@ -1338,7 +1353,7 @@ def scan_for_meshtastic():
 
 def check_ack_timeout():
     """檢查並處理 ACK 超時的訊息"""
-    global pending_ack
+    global pending_ack, FLAG_DEVICE_WAITING_ACK
     current_time = int(time.time())
     timeout_requests = []
     
@@ -1352,8 +1367,10 @@ def check_ack_timeout():
         print(f"[ACK 超時] request_id={request_id}, note_id={note_id}")
         print(f"  -> 將狀態從 'Sending' 改回 'LAN only'，等待重送")
         
+        FLAG_DEVICE_WAITING_ACK = False
+        
         if update_note_status(note_id, 'LAN only'):
-            print(f"  -> 成功更新 note {note_id} 狀態為 'LAN only'")
+            print(f"  -> 更新 note {note_id} 狀態為 'LAN only'")
             socketio.emit('refresh_notes', {'board_id': BOARD_MESSAGE_CHANEL_NAME})
         
         del pending_ack[request_id]
@@ -1411,7 +1428,10 @@ def send_scheduler_loop():
                        "裝置路徑" in error_str and "已消失" in error_str:
                         error_msg = "連線失敗：USB連線異常中斷，可能是 Pi 電力供應不足、更換線材、或 Mesh 裝置需要重啟"
                         print(f"[排程器] {error_msg}")
+                        lora_connected = False
+                        FLAG_DEVICE_WAITING_ACK = False
                         socketio.emit('usb_connection_error', {'message': error_msg})
+                        socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False})
                 
                 continue
             
@@ -1473,7 +1493,10 @@ def send_scheduler_loop():
                    "裝置路徑" in error_str and "已消失" in error_str:
                     error_msg = "連線失敗：USB連線異常中斷，可能是 Pi 電力供應不足、更換線材、或 Mesh 裝置需要重啟"
                     print(f"[排程器] {error_msg}")
+                    lora_connected = False
+                    FLAG_DEVICE_WAITING_ACK = False
                     socketio.emit('usb_connection_error', {'message': error_msg})
+                    socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False})
                 
         except Exception as e:
             error_str = str(e)
@@ -2433,7 +2456,20 @@ def change_note_color(board_id, note_id):
 @app.route('/api/boards/<board_id>/notes/<note_id>/pin', methods=['POST'])
 def pin_board_note(board_id, note_id):
     """置頂 note (僅限管理者)"""
-    global interface, lora_connected
+    global interface, lora_connected, FLAG_DEVICE_WAITING_ACK
+    
+    if FLAG_DEVICE_WAITING_ACK:
+        return jsonify({
+            'success': False,
+            'error': 'LoRa設備忙碌中'
+        }), 503
+    
+    if not interface or not lora_connected:
+        return jsonify({
+            'success': False,
+            'error': 'LoRa not connected'
+        }), 503
+    
     try:
         if UID_SOURCE == "mac":
             client_ip = request.remote_addr
@@ -2516,7 +2552,18 @@ def pin_board_note(board_id, note_id):
                 interface.sendText(pin_cmd, channelIndex=get_channel_index(interface, board_id))
                 print(f"已發送置頂命令: {pin_cmd}")
             except Exception as e:
+                error_str = str(e)
                 print(f"發送置頂命令失敗: {e}")
+                
+                # 檢測 USB 連線異常
+                if "Timed out waiting for connection completion" in error_str or \
+                   "device disconnected" in error_str or \
+                   "裝置路徑" in error_str and "已消失" in error_str:
+                    error_msg = "連線失敗：USB連線異常中斷，可能是 Pi 電力供應不足、更換線材、或 Mesh 裝置需要重啟"
+                    print(f"[pin_board_note] {error_msg}")
+                    lora_connected = False
+                    socketio.emit('usb_connection_error', {'message': error_msg})
+                    socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False})
         
         socketio.emit('refresh_notes', {'board_id': board_id})
         
@@ -2609,6 +2656,12 @@ def resend_board_note(board_id, note_id):
             'error': 'LoRa設備忙碌中'
         }), 503
     
+    if not interface or not lora_connected:
+        return jsonify({
+            'success': False,
+            'error': 'LoRa not connected'
+        }), 503
+    
     try:
         data = request.get_json() or {}
         author_key = data.get('author_key', 'user-unknown')
@@ -2678,13 +2731,6 @@ def resend_board_note(board_id, note_id):
                 'error': 'Note has no lora_msg_id'
             }), 400
         
-        if not interface or not lora_connected:
-            conn.close()
-            return jsonify({
-                'success': False,
-                'error': 'LoRa not connected'
-            }), 503
-        
         # 更新 resent_count
         timestamp = int(time.time() * 1000)
         cursor.execute('''
@@ -2715,18 +2761,18 @@ def resend_board_note(board_id, note_id):
             print(f"  -> 已發送重新發送命令 (note_id={note_id}, resent_count={resent_count + 1})")
             print(f"  -> color_id={color_id}, author_key={db_author_key} 已在訊息中一併發送")
             
-            # 如果該 note 有 is_pined_note = true，延遲 5 秒後發送 /pin 命令
+            # 如果該 note 有 is_pined_note = true，延遲 15 秒後發送 /pin 命令
             if is_pined_note == 1:
                 def send_pin_command():
                     try:
                         pin_cmd = f"/pin [{lora_msg_id}]{db_author_key}"
                         interface.sendText(pin_cmd, channelIndex=channel_index)
-                        print(f"  -> [延遲 5 秒後] 已發送 pin 命令: {pin_cmd}")
+                        print(f"  -> [延遲 15 秒後] 已發送 pin 命令: {pin_cmd}")
                     except Exception as e:
-                        print(f"  -> [延遲 5 秒後] 發送 pin 命令失敗: {e}")
+                        print(f"  -> [延遲 15 秒後] 發送 pin 命令失敗: {e}")
                 
-                eventlet.spawn_after(5, send_pin_command)
-                print(f"  -> 已排程在 5 秒後發送 pin 命令")
+                eventlet.spawn_after(15, send_pin_command)
+                print(f"  -> 已排程在 15 秒後發送 pin 命令")
             
             socketio.emit('refresh_notes', {'board_id': board_id})
             
@@ -2738,9 +2784,21 @@ def resend_board_note(board_id, note_id):
             }), 200
             
         except Exception as e:
+            error_str = str(e)
             print(f"[重新發送] 發送失敗: {e}")
             import traceback
             traceback.print_exc()
+            
+            # 檢測 USB 連線異常
+            if "Timed out waiting for connection completion" in error_str or \
+               "device disconnected" in error_str or \
+               "裝置路徑" in error_str and "已消失" in error_str:
+                error_msg = "連線失敗：USB連線異常中斷，可能是 Pi 電力供應不足、更換線材、或 Mesh 裝置需要重啟"
+                print(f"[resend_board_note] {error_msg}")
+                lora_connected = False
+                socketio.emit('usb_connection_error', {'message': error_msg})
+                socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False})
+            
             return jsonify({
                 'success': False,
                 'error': f'Failed to send: {str(e)}'
