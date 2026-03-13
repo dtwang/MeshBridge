@@ -45,16 +45,52 @@ header.header-hidden {
 .header-left {
   display: flex;
   flex-direction: column;
+  position: relative;
 }
 
-.app-name {
+.board-name {
   font-size: 1.1em;
   font-weight: bold;
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
-.app-link {
+.app-label {
   font-size: 0.75em;
   color: #bdc3c7;
+}
+
+.channel-arrow {
+  font-size: 0.6em;
+  margin-left: 2px;
+  opacity: 0.7;
+}
+
+.channel-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  background: #2c3e50;
+  border: 1px solid #3d5166;
+  border-radius: 6px;
+  padding: 4px 0;
+  z-index: 100;
+  min-width: 140px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  margin-top: 4px;
+}
+
+.channel-dropdown-item {
+  padding: 6px 14px;
+  font-size: 0.9em;
+  color: #ecf0f1;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.channel-dropdown-item:hover {
+  background: #3d5166;
 }
 
 .status-container {
@@ -941,7 +977,8 @@ header.header-hidden {
 .btn-edit,
 .btn-delete,
 .btn-color,
-.btn-pin {
+.btn-pin,
+.btn-resend-pin {
   background: rgba(44, 62, 80, 0.15);
   border: none;
   border-radius: 50%;
@@ -959,7 +996,8 @@ header.header-hidden {
 .btn-edit:hover,
 .btn-delete:hover,
 .btn-color:hover,
-.btn-pin:hover {
+.btn-pin:hover,
+.btn-resend-pin:hover {
   background: rgba(44, 62, 80, 0.3);
   transform: scale(1.1);
 }
@@ -967,7 +1005,8 @@ header.header-hidden {
 .btn-edit:active,
 .btn-delete:active,
 .btn-color:active,
-.btn-pin:active {
+.btn-pin:active,
+.btn-resend-pin:active {
   transform: scale(0.95);
 }
 
@@ -987,11 +1026,13 @@ header.header-hidden {
   background: rgba(155, 89, 182, 0.3);
 }
 
-.btn-pin {
+.btn-pin,
+.btn-resend-pin {
   background: rgba(52, 152, 219, 0.15);
 }
 
-.btn-pin:hover {
+.btn-pin:hover,
+.btn-resend-pin:hover {
   background: rgba(52, 152, 219, 0.3);
 }
 
@@ -1313,11 +1354,11 @@ header.header-hidden {
     flex-wrap: wrap;
   }
 
-  .app-name {
+  .board-name {
     font-size: 1em;
   }
 
-  .app-link {
+  .app-label {
     font-size: 0.7em;
   }
 
@@ -1568,7 +1609,7 @@ header.header-hidden {
     gap: 10px;
   }
 
-  .app-name {
+  .board-name {
     font-size: 0.95em;
   }
 

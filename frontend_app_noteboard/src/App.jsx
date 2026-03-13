@@ -58,6 +58,13 @@ function App() {
   const [channelErrorMessage, setChannelErrorMessage] = useState(null)
   const [powerIssue, setPowerIssue] = useState(false)
   const [boardId, setBoardId] = useState(DEFAULT_BOARD_ID)
+  const [activeChannels, setActiveChannels] = useState([])
+  const [showChannelDropdown, setShowChannelDropdown] = useState(false)
+  const [channelVerifiedStatus, setChannelVerifiedStatus] = useState({})
+  const [showPasswordModal, setShowPasswordModal] = useState(false)
+  const [pendingChannel, setPendingChannel] = useState(null)
+  const [passwordInput, setPasswordInput] = useState('')
+  const [passwordError, setPasswordError] = useState('')
   const [myUUID, setMyUUID] = useState('')
   const [isCreatingNote, setIsCreatingNote] = useState(false)
   const [draftText, setDraftText] = useState('')
@@ -98,10 +105,10 @@ function App() {
   const [senderTooltipData, setSenderTooltipData] = useState(null)
   const senderTooltipRef = useRef(null)
   const senderStatusRefs = useRef({})
-  const [isAdmin, setIsAdmin] = useState(false)
+  const [adminChannels, setAdminChannels] = useState([])
   const [showAdminModal, setShowAdminModal] = useState(false)
   const [adminPasscode, setAdminPasscode] = useState('')
-  const [postPasscodeRequired, setPostPasscodeRequired] = useState(false)
+  const [channelsPostPasscode, setChannelsPostPasscode] = useState({})
   const [draftPostPasscode, setDraftPostPasscode] = useState('')
   const [replyPostPasscode, setReplyPostPasscode] = useState('')
   const [showLocationPicker, setShowLocationPicker] = useState(false)
@@ -112,6 +119,11 @@ function App() {
   const [isSubmittingDraft, setIsSubmittingDraft] = useState(false)
   const [isSubmittingReply, setIsSubmittingReply] = useState(false)
   const [isSubmittingEdit, setIsSubmittingEdit] = useState(false)
+
+  // 根據當前 boardId 判斷是否為該頻道的管理者
+  const isAdmin = adminChannels.includes(boardId)
+  // 根據當前 boardId 判斷是否需要張貼通關碼
+  const postPasscodeRequired = channelsPostPasscode[boardId] || false
 
   useEffect(() => {
     const fetchUserLastLocation = async () => {
@@ -195,14 +207,18 @@ function App() {
 
   useEffect(() => {
     const initializeApp = async () => {
+      // 從 localStorage 載入先前儲存的頻道清單
       try {
-        const channelResponse = await fetch('/api/config/channel_name')
-        const channelData = await channelResponse.json()
-        if (channelData.success) {
-          setBoardId(channelData.channel_name)
+        const cachedChannels = localStorage.getItem('activeChannels')
+        if (cachedChannels) {
+          const parsedChannels = JSON.parse(cachedChannels)
+          if (Array.isArray(parsedChannels) && parsedChannels.length > 0) {
+            setActiveChannels(parsedChannels)
+            console.log('已從快取載入頻道清單:', parsedChannels)
+          }
         }
       } catch (error) {
-        console.error('Failed to fetch channel name from backend:', error)
+        console.error('Failed to load cached channels:', error)
       }
 
       try {
@@ -221,10 +237,12 @@ function App() {
       }
 
       try {
-        const adminResponse = await fetch('/api/user/admin/status')
+        const adminResponse = await fetch('/api/user/admin/status', {
+          credentials: 'include'
+        })
         const adminData = await adminResponse.json()
-        if (adminData.success) {
-          setIsAdmin(adminData.is_admin)
+        if (adminData.success && adminData.admin_channels) {
+          setAdminChannels(adminData.admin_channels)
         }
       } catch (error) {
         console.error('Failed to fetch admin status:', error)
@@ -233,8 +251,8 @@ function App() {
       try {
         const passcodeResponse = await fetch('/api/config/post_passcode_required')
         const passcodeData = await passcodeResponse.json()
-        if (passcodeData.success) {
-          setPostPasscodeRequired(passcodeData.required)
+        if (passcodeData.success && passcodeData.channels_post_passcode) {
+          setChannelsPostPasscode(passcodeData.channels_post_passcode)
         }
       } catch (error) {
         console.error('Failed to fetch post passcode config:', error)
@@ -250,6 +268,46 @@ function App() {
         console.error('Failed to fetch features config:', error)
       }
 
+      let initialBoard = null
+      try {
+        const currentBoardResponse = await fetch('/api/session/current_board')
+        const currentBoardData = await currentBoardResponse.json()
+        if (currentBoardData.success && currentBoardData.board_id) {
+          initialBoard = currentBoardData.board_id
+          setBoardId(initialBoard)
+        }
+      } catch (error) {
+        console.error('Failed to fetch current board:', error)
+      }
+
+      let statusMap = {}
+      try {
+        const verifiedStatusResponse = await fetch('/api/channel/verified_status')
+        const verifiedStatusData = await verifiedStatusResponse.json()
+        if (verifiedStatusData.success && verifiedStatusData.channels) {
+          verifiedStatusData.channels.forEach(ch => {
+            statusMap[ch.name] = {
+              requiresPassword: ch.requires_password,
+              isVerified: ch.is_verified
+            }
+          })
+          setChannelVerifiedStatus(statusMap)
+        }
+      } catch (error) {
+        console.error('Failed to fetch verified status:', error)
+      }
+
+      // 檢查初始 board 是否需要密碼驗證
+      if (initialBoard && statusMap[initialBoard]) {
+        const boardStatus = statusMap[initialBoard]
+        if (boardStatus.requiresPassword && !boardStatus.isVerified) {
+          setPendingChannel(initialBoard)
+          setPasswordInput('')
+          setPasswordError('')
+          setShowPasswordModal(true)
+        }
+      }
+
       const newSocket = io()
       setSocket(newSocket)
 
@@ -259,6 +317,28 @@ function App() {
         setChannelErrorMessage(data.error_message || null)
         setPowerIssue(data.power_issue || false)
         
+        // 只有當收到非空的 active_channels 時才更新
+        // 當 LoRa 斷線時，後端會發送空陣列，但我們保留快取的頻道清單
+        if (data.active_channels && data.active_channels.length > 0) {
+          setActiveChannels(data.active_channels)
+          setBoardId(prev => {
+            // 只有當 prev 是預設值時，才切換到第一個 active channel
+            // 這樣可以避免覆蓋從 session 載入的 board
+            if (prev === DEFAULT_BOARD_ID && data.active_channels.length > 0) {
+              return data.active_channels[0]
+            }
+            // 如果從 session 載入的 board 已不在可用頻道中，自動回到預設頻道
+            if (prev !== DEFAULT_BOARD_ID && data.active_channels.length > 0 && !data.active_channels.includes(prev)) {
+              console.log(`⚠️ 先前選擇的頻道 "${prev}" 已不在可用頻道中，自動切換至 "${data.active_channels[0]}"`)
+              return data.active_channels[0]
+            }
+            return prev
+          })
+        } else if (data.active_channels && data.active_channels.length === 0) {
+          // LoRa 斷線時收到空陣列，保留現有的 activeChannels（從快取載入的）
+          console.log('LoRa 斷線，保留快取的頻道清單以供切換')
+        }
+
         if (data.online && data.channel_validated === false) {
           console.log('⚠️ LoRa 已連線，但 Channel 名稱不符合設定')
           if (data.error_message) {
@@ -276,6 +356,29 @@ function App() {
       }
     }
   }, [])
+
+  // 將 activeChannels 儲存到 localStorage，以便在 LoRa 斷線時仍可切換頻道
+  useEffect(() => {
+    if (activeChannels.length > 0) {
+      try {
+        localStorage.setItem('activeChannels', JSON.stringify(activeChannels))
+        console.log('已儲存頻道清單到快取:', activeChannels)
+      } catch (error) {
+        console.error('Failed to cache channels:', error)
+      }
+    }
+  }, [activeChannels])
+
+  useEffect(() => {
+    if (!showChannelDropdown) return
+    const handleClickOutside = (e) => {
+      if (!e.target.closest('.header-left')) {
+        setShowChannelDropdown(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [showChannelDropdown])
 
   useEffect(() => {
     if (!socket) return
@@ -505,7 +608,7 @@ function App() {
       setShowAdminModal(true)
       setAdminPasscode('')
     } else {
-      const confirmed = await showConfirm('確定要登出管理者身份，切換為一般使用者嗎？', '登出管理者')
+      const confirmed = await showConfirm(`確定要登出頻道 "${boardId}" 的管理者身份，切換為一般使用者嗎？`, '登出管理者')
       if (confirmed) {
         handleAdminLogout()
       }
@@ -521,20 +624,22 @@ function App() {
     try {
       const response = await fetch('/api/user/admin/authenticate', {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          passcode: adminPasscode
+          passcode: adminPasscode,
+          board_id: boardId
         })
       })
 
       const data = await response.json()
       if (data.success && data.is_admin) {
-        setIsAdmin(true)
+        setAdminChannels(prev => prev.includes(boardId) ? prev : [...prev, boardId])
         setShowAdminModal(false)
         setAdminPasscode('')
-        showAlert('已切換至管理者身份', '成功')
+        showAlert(`已切換至頻道 "${boardId}" 的管理者身份`, '成功')
       } else {
         showAlert('密碼錯誤，請重新輸入', '錯誤')
         setAdminPasscode('')
@@ -554,15 +659,19 @@ function App() {
     try {
       const response = await fetch('/api/user/admin/logout', {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json'
-        }
+        },
+        body: JSON.stringify({
+          board_id: boardId
+        })
       })
 
       const data = await response.json()
       if (data.success) {
-        setIsAdmin(false)
-        showAlert('已切換為一般使用者', '成功')
+        setAdminChannels(prev => prev.filter(ch => ch !== boardId))
+        showAlert(`已登出頻道 "${boardId}" 的管理者身份`, '成功')
       } else {
         showAlert('登出失敗：' + (data.error || '未知錯誤'), '錯誤')
       }
@@ -598,6 +707,32 @@ function App() {
     }
   }
 
+  const handleResendPin = async (noteId) => {
+    const confirmed = await showConfirm('確認重新發送置頂指令？', '重送置頂')
+    if (!confirmed) {
+      return
+    }
+
+    try {
+      const response = await fetch(`/api/boards/${boardId}/notes/${noteId}/pin`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      })
+
+      const data = await response.json()
+      if (data.success) {
+        showAlert('已重新發送置頂指令', '成功')
+      } else {
+        showAlert('重送置頂失敗：' + (data.error || '未知錯誤'), '錯誤')
+      }
+    } catch (error) {
+      console.error('Failed to resend pin:', error)
+      showAlert('重送置頂失敗：' + error.message, '錯誤')
+    }
+  }
+
   const deleteNote = async (index) => {
     const newNotes = notes.filter((_, i) => i !== index)
     setNotes(newNotes)
@@ -625,6 +760,91 @@ function App() {
     setReplyColorIndex(0)
     setReplyByteCount(0)
     setReplyPostPasscode('')
+  }
+
+  const handleChannelSwitch = async (channelName) => {
+    const status = channelVerifiedStatus[channelName]
+    
+    if (status && status.requiresPassword && !status.isVerified) {
+      setPendingChannel(channelName)
+      setPasswordInput('')
+      setPasswordError('')
+      setShowPasswordModal(true)
+      setShowChannelDropdown(false)
+      return
+    }
+    
+    try {
+      const response = await fetch('/api/session/select_board', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ board_id: channelName })
+      })
+      const data = await response.json()
+      if (data.success) {
+        setBoardId(channelName)
+        setShowChannelDropdown(false)
+      }
+    } catch (error) {
+      console.error('Failed to switch channel:', error)
+    }
+  }
+
+  const handlePasswordSubmit = async () => {
+    if (!pendingChannel) return
+    
+    setPasswordError('')
+    
+    try {
+      const response = await fetch('/api/channel/verify_password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          channel_name: pendingChannel,
+          password: passwordInput 
+        })
+      })
+      const data = await response.json()
+      
+      if (data.success && data.verified) {
+        setChannelVerifiedStatus(prev => ({
+          ...prev,
+          [pendingChannel]: {
+            ...prev[pendingChannel],
+            isVerified: true
+          }
+        }))
+        
+        const selectResponse = await fetch('/api/session/select_board', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ board_id: pendingChannel })
+        })
+        const selectData = await selectResponse.json()
+        if (selectData.success) {
+          const verifiedChannel = pendingChannel
+          setBoardId(verifiedChannel)
+          setShowPasswordModal(false)
+          setPendingChannel(null)
+          setPasswordInput('')
+          
+          // 密碼驗證成功後自動載入 notes
+          await fetchNotes(showArchived, verifiedChannel)
+        }
+      } else {
+        setPasswordError('密碼錯誤，請重試')
+      }
+    } catch (error) {
+      console.error('Failed to verify password:', error)
+      setPasswordError('驗證失敗，請重試')
+    }
+  }
+
+  const handlePasswordCancel = () => {
+    setShowPasswordModal(false)
+    setPendingChannel(null)
+    setPasswordInput('')
+    setPasswordError('')
   }
 
   const handleCancelReply = () => {
@@ -1499,8 +1719,12 @@ function App() {
           <div className="note-actions">
             <button className="btn-delete" onClick={() => handleDeleteNote(data.noteId, false)}>🗑️</button>
             <button className="btn-color" onClick={() => handleOpenColorPicker(data)}>🎨</button>
-            {isAdmin && !isReply && !data.replyLoraMessageId && !data.isTempParentNote && !data.archived && !data.isPinedNote && data.status !== 'Sending' && (
-              <button className="btn-pin" onClick={() => handlePinNote(data.noteId)}>📌</button>
+            {isAdmin && !isReply && !data.replyLoraMessageId && !data.isTempParentNote && !data.archived && data.status !== 'Sending' && (
+              data.isPinedNote ? (
+                <button className="btn-resend-pin" onClick={() => handleResendPin(data.noteId)} title="重送置頂">📌</button>
+              ) : (
+                <button className="btn-pin" onClick={() => handlePinNote(data.noteId)}>📌</button>
+              )
             )}
           </div>
         )}
@@ -1508,8 +1732,12 @@ function App() {
           <div className="note-actions">
             <button className="btn-delete" onClick={() => handleDeleteNote(data.noteId, false, senderID)}>🗑️</button>
             <button className="btn-color" onClick={() => handleOpenColorPicker(data)}>🎨</button>
-            {!isReply && !data.replyLoraMessageId && !data.isTempParentNote && !data.isPinedNote && data.status !== 'Sending' && (
-              <button className="btn-pin" onClick={() => handlePinNote(data.noteId)}>📌</button>
+            {!isReply && !data.replyLoraMessageId && !data.isTempParentNote && data.status !== 'Sending' && (
+              data.isPinedNote ? (
+                <button className="btn-resend-pin" onClick={() => handleResendPin(data.noteId)} title="重送置頂">📌</button>
+              ) : (
+                <button className="btn-pin" onClick={() => handlePinNote(data.noteId)}>📌</button>
+              )
             )}
           </div>
         )}
@@ -1634,8 +1862,40 @@ function App() {
     <>
       <header className={headerVisible ? 'header-visible' : 'header-hidden'}>
         <div className="header-left">
-          <div className="app-name">MeshBridge: {boardId} 便利貼公告欄</div>
-          <div className="app-link">noteboard.meshbridge.com</div>
+          <div
+            className="board-name"
+            onClick={() => { if (activeChannels.length > 1) setShowChannelDropdown(!showChannelDropdown) }}
+            style={{ cursor: activeChannels.length > 1 ? 'pointer' : 'default' }}
+          >
+            {boardId}
+            {channelVerifiedStatus[boardId] && channelVerifiedStatus[boardId].requiresPassword && (
+              <span style={{ marginLeft: '4px' }}>
+                {channelVerifiedStatus[boardId].isVerified ? '🔓' : '🔒'}
+              </span>
+            )}
+            {activeChannels.length > 1 && (
+              <span className="channel-arrow">{showChannelDropdown ? '▲' : '▼'}</span>
+            )}
+          </div>
+          {showChannelDropdown && activeChannels.length > 1 && (
+            <div className="channel-dropdown">
+              {activeChannels.filter(ch => ch !== boardId).map(ch => (
+                <div
+                  key={ch}
+                  className="channel-dropdown-item"
+                  onClick={() => handleChannelSwitch(ch)}
+                >
+                  {ch}
+                  {channelVerifiedStatus[ch] && channelVerifiedStatus[ch].requiresPassword && (
+                    <span style={{ marginLeft: '4px' }}>
+                      {channelVerifiedStatus[ch].isVerified ? '🔓' : '🔒'}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="app-label">MeshNoteboard 便利貼牆</div>
         </div>
         
         <div className="status-container" style={{ position: 'relative' }}>
@@ -1651,7 +1911,7 @@ function App() {
         </div>
         <div className="user-role-container" onClick={handleUserRoleClick} style={{ cursor: 'pointer' }}>
           <div className="user-role-label">
-            {isAdmin ? '👑管理者' : '一般用戶'}
+            {isAdmin ? '👑頻道管理者' : '一般用戶'}
           </div>
         </div>
       </header>
@@ -1804,7 +2064,7 @@ function App() {
 
       <footer className="app-footer">
         <div className="footer-left">uid={myUUID}</div>
-        <div className="footer-right">MeshNoteboard v0.4.1</div>
+        <div className="footer-right">MeshNoteboard v0.5.0</div>
       </footer>
 
       {modalConfig.show && (
@@ -1914,9 +2174,9 @@ function App() {
       {showAdminModal && (
         <div className="modal-overlay" onClick={handleCloseAdminModal}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">管理者認證</div>
+            <div className="modal-header">管理者認證 - {boardId}</div>
             <div className="modal-body">
-              <p>請輸入管理者密碼以切換至管理者身份：</p>
+              <p>請輸入頻道 "{boardId}" 的管理者密碼：</p>
               <input
                 type="password"
                 className="admin-passcode-input"
@@ -1936,6 +2196,41 @@ function App() {
                 取消
               </button>
               <button className="modal-btn modal-btn-confirm" onClick={handleAdminAuthenticate}>
+                確定
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showPasswordModal && (
+        <div className="modal-overlay" onClick={handlePasswordCancel}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">頻道密碼驗證</div>
+            <div className="modal-body">
+              <p>頻道 "{pendingChannel}" 需要密碼才能進入：</p>
+              <input
+                type="password"
+                className="admin-passcode-input"
+                placeholder="輸入頻道密碼"
+                value={passwordInput}
+                onChange={(e) => setPasswordInput(e.target.value)}
+                onKeyPress={(e) => {
+                  if (e.key === 'Enter') {
+                    handlePasswordSubmit()
+                  }
+                }}
+                autoFocus
+              />
+              {passwordError && (
+                <p style={{ color: '#e74c3c', marginTop: '8px', fontSize: '0.9em' }}>{passwordError}</p>
+              )}
+            </div>
+            <div className="modal-actions">
+              <button className="modal-btn modal-btn-cancel" onClick={handlePasswordCancel}>
+                取消
+              </button>
+              <button className="modal-btn modal-btn-confirm" onClick={handlePasswordSubmit}>
                 確定
               </button>
             </div>

@@ -329,45 +329,99 @@ NOTEBOARD_POST_PASSCODE = "1234"
 MeshBridge/config.py
 ```
 
-### 設定參數
+### 5.1 通用參數
 
 | 參數名稱 | 類型 | 預設值 | 說明 |
 |---------|------|--------|------|
 | `LOCAL_APP` | string | `"noteboard"` | 應用模式選擇：`"chat"` 或 `"noteboard"` |
-| `BOARD_MESSAGE_CHANEL_NAME` | string | `"YourChannelName"` | LoRa 頻道名稱，需與 Meshtastic 裝置設定一致 |
 | `SEND_INTERVAL_SECOND` | int | `30` | 自動發送排程器間隔時間（秒），最小值不小於 10 秒 |
-| `MAX_NOTE_SHOW` | int | `200` | 前端顯示的最大留言數量（不含已封存） |
-| `MAX_ARCHIVED_NOTE_SHOW` | int | `200` | 前端顯示的最大已封存留言數量 |
-| `NOTEBOARD_ADMIN_PASSCODE` | string | - | 管理者密碼，用於認證管理者身份 |
-| `NOTEBOARD_POST_PASSCODE` | string | `""` | 發送用通關碼，留空則停用此功能 |
+| `ACK_TIMEOUT_SECONDS` | int | `60` | 等待 LoRa ACK 回覆的超時時間（秒），超時後留言狀態回退為 `LAN only` |
 
-### 設定範例
+### 5.2 多頻道設定（BOARD_MESSAGE_CHANNELS）
+
+新版採用 `BOARD_MESSAGE_CHANNELS` 參數，以列表方式設定一個或多個 LoRa 頻道，每個頻道可獨立設定進入密碼、管理者密碼、發文通關碼與顯示數量上限。
+
+系統啟動後會逐一比對設定中的頻道名稱與 Meshtastic 裝置上實際存在的頻道，僅將**名稱相符**的頻道標記為可用（active）。
+
+#### 參數格式
+
+```python
+BOARD_MESSAGE_CHANNELS = [
+    {
+        "name": "頻道名稱",
+        "user_passcode": "進入密碼",
+        "admin_passcode": "管理者密碼",
+        "post_passcode": "發文通關碼",
+        "max_notes": 200,
+        "max_archived_notes": 200
+    },
+    # 可設定多個頻道 ...
+]
+```
+
+#### 各欄位說明
+
+| 欄位名稱 | 類型 | 必填 | 預設值 | 說明 |
+|---------|------|------|--------|------|
+| `name` | string | ✅ | - | LoRa 頻道名稱，需與 Meshtastic 裝置上的頻道名稱**完全一致**（區分大小寫） |
+| `user_passcode` | string | ❌ | `""` | 頻道進入密碼。設定後，使用者須輸入正確密碼才能進入該頻道檢視與操作留言；留空則任何人皆可進入 |
+| `admin_passcode` | string | ✅ | - | 管理者密碼，用於認證管理者身份，取得封存他人留言、置頂、變更他人顏色等進階權限 |
+| `post_passcode` | string | ❌ | `""` | 發文用通關碼。設定後，一般使用者須輸入正確通關碼才能張貼留言或回覆；管理者不受此限制；留空則停用 |
+| `max_notes` | int | ❌ | `200` | 前端顯示的最大留言數量（不含已封存） |
+| `max_archived_notes` | int | ❌ | `200` | 前端顯示的最大已封存留言數量 |
+
+#### 設定範例
 
 ```python
 # 應用模式
 LOCAL_APP = "noteboard"
 
-# LoRa 頻道設定（需與 Meshtastic 裝置的頻道名稱一致）
-BOARD_MESSAGE_CHANEL_NAME = "YourChannelName"
-
 # 發送間隔（秒）- 控制 LAN only 留言自動發送至 LoRa 的頻率
 SEND_INTERVAL_SECOND = 30
 
-# 顯示數量限制
-MAX_NOTE_SHOW = 200           # 一般留言顯示上限
-MAX_ARCHIVED_NOTE_SHOW = 200  # 封存留言顯示上限
+# ACK 超時時間（秒）
+ACK_TIMEOUT_SECONDS = 60
 
-# 管理者密碼（用於認證管理者身份）
+# 多頻道設定
+BOARD_MESSAGE_CHANNELS = [
+    {
+        "name": "MQBoardTest",            # 頻道名稱（需與裝置一致）
+        "user_passcode": "",              # 不設進入密碼，任何人可進入
+        "admin_passcode": "667788",       # 管理者密碼
+        "post_passcode": "",              # 不設發文通關碼
+        "max_notes": 200,                 # 一般留言顯示上限
+        "max_archived_notes": 200         # 封存留言顯示上限
+    },
+    {
+        "name": "TeamAlpha",              # 第二個頻道
+        "user_passcode": "1234",          # 需輸入密碼才能進入此頻道
+        "admin_passcode": "998877",       # 此頻道的管理者密碼
+        "post_passcode": "5678",          # 需輸入通關碼才能發文
+        "max_notes": 200,
+        "max_archived_notes": 200
+    }
+]
+```
+
+### 5.3 舊版單一頻道設定（已棄用）
+
+以下為舊版單一頻道格式，仍可辨識但**不建議繼續使用**，請改用上方的 `BOARD_MESSAGE_CHANNELS` 多頻道格式：
+
+```python
+# ⚠️ 舊版格式，不再建議使用
+BOARD_MESSAGE_CHANEL_NAME = "YourChannelName"
+MAX_NOTE_SHOW = 200
+MAX_ARCHIVED_NOTE_SHOW = 200
 NOTEBOARD_ADMIN_PASSCODE = "your_admin_password"
-
-# 發送用通關碼（留空則停用此功能）
-NOTEBOARD_POST_PASSCODE = "1234"  # 設定為 "" 可停用發送通關碼功能
+NOTEBOARD_POST_PASSCODE = "1234"
 ```
 
 ### 注意事項
 
-- **頻道名稱**：`BOARD_MESSAGE_CHANEL_NAME` 必須與 Meshtastic 裝置上設定的頻道名稱完全一致（區分大小寫）
+- **頻道名稱**：`name` 必須與 Meshtastic 裝置上設定的頻道名稱完全一致（區分大小寫），不可使用保留名稱（如 `MeshTW`、`Emergency!`）
 - **發送間隔**：`SEND_INTERVAL_SECOND` 建議設定在 30-180 秒之間，避免 LoRa 頻寬阻塞
+- **頻道可用性**：系統啟動連線裝置後，僅有在裝置上實際存在的頻道會被標記為 active；未在裝置上找到的頻道設定仍會保留，但無法收發 LoRa 訊息
+- **密碼獨立性**：每個頻道的 `user_passcode`、`admin_passcode`、`post_passcode` 互相獨立，建議設定為不同的值以提高安全性
 
 ## 6. LoRa 指令說明
 

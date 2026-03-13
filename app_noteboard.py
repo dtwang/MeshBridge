@@ -16,7 +16,12 @@ from flask_socketio import SocketIO, emit
 from meshtastic.serial_interface import SerialInterface
 from pubsub import pub
 import config
-from config import BOARD_MESSAGE_CHANEL_NAME, SEND_INTERVAL_SECOND, ACK_TIMEOUT_SECONDS, MAX_NOTE_SHOW, MAX_ARCHIVED_NOTE_SHOW, NOTEBOARD_ADMIN_PASSCODE
+from config import SEND_INTERVAL_SECOND, ACK_TIMEOUT_SECONDS, BOARD_MESSAGE_CHANNELS
+
+print(f"[系統] 使用多頻道設定: {[ch['name'] for ch in BOARD_MESSAGE_CHANNELS]}")
+
+# 所有設定中的頻道名稱（用於驗證）
+CONFIGURED_CHANNEL_NAMES = [ch['name'] for ch in BOARD_MESSAGE_CHANNELS]
 NOTEBOARD_MBTILES_FOLDER = getattr(config, 'NOTEBOARD_MBTILES_FOLDER', './maps')
 NOTEBOARD_MBTILES_LAYER_MODE = getattr(config, 'NOTEBOARD_MBTILES_LAYER_MODE', 'auto')
 from app import get_power_status
@@ -63,11 +68,6 @@ def patch_meshtastic_error_handling():
 patch_meshtastic_error_handling()
 
 try:
-    from config import NOTEBOARD_POST_PASSCODE
-except ImportError:
-    NOTEBOARD_POST_PASSCODE = ""
-
-try:
     from config import UID_SOURCE
 except ImportError:
     UID_SOURCE = "mac"
@@ -75,14 +75,15 @@ except ImportError:
 # 控制是否印出完整 LoRa 封包資訊
 IS_PRINT_LORA_PACKAGE = False
 
-# 驗證 BOARD_MESSAGE_CHANEL_NAME 設定
+# 驗證頻道設定
 FORBIDDEN_CHANNEL_NAMES = ["MeshTW", "Emergency!"]
 
-if not BOARD_MESSAGE_CHANEL_NAME or BOARD_MESSAGE_CHANEL_NAME.strip() == "":
-    raise ValueError("BOARD_MESSAGE_CHANEL_NAME 不得為空")
-
-if BOARD_MESSAGE_CHANEL_NAME in FORBIDDEN_CHANNEL_NAMES:
-    raise ValueError(f"BOARD_MESSAGE_CHANEL_NAME 不得為: {', '.join(FORBIDDEN_CHANNEL_NAMES)}")
+for _ch_cfg in BOARD_MESSAGE_CHANNELS:
+    _ch_name = _ch_cfg.get('name', '')
+    if not _ch_name or _ch_name.strip() == "":
+        raise ValueError("頻道名稱不得為空")
+    if _ch_name in FORBIDDEN_CHANNEL_NAMES:
+        raise ValueError(f"頻道名稱 '{_ch_name}' 不得為: {', '.join(FORBIDDEN_CHANNEL_NAMES)}")
 
 app = Flask(__name__, 
                template_folder='templates/app_noteboard',
@@ -97,6 +98,7 @@ interface = None
 current_dev_path = None
 lora_connected = False
 channel_validated = False
+active_channels = []  # 連線後實際可用的頻道清單 (從 BOARD_MESSAGE_CHANNELS 中篩選出設備上存在的頻道)
 pending_ack = {}
 FLAG_DEVICE_WAITING_ACK = False
 send_interval = max(SEND_INTERVAL_SECOND, 10)
@@ -106,8 +108,40 @@ isDeviceProvideLocation = False
 DB_PATH = 'noteboard.db'
 MAX_NOTES = 200
 
-admin_users = set()
 user_last_locations = {}
+
+# MAC 模式的伺服器端 session 儲存（不支援 cookie 的客戶端使用）
+# 格式：{mac_address: {'admin_channels': [...], 'verified_channels': [...], 'selected_board': '...'}}
+mac_sessions = {}
+
+def _get_mac_address_for_request():
+    """取得當前請求的 MAC address（僅 MAC 模式有效）"""
+    if UID_SOURCE != "mac":
+        return None
+    client_ip = request.remote_addr
+    return mac_from_ip(client_ip)
+
+def get_session_value(key, default=None):
+    """取得 session 值（自動判斷 MAC 模式或 Flask session）"""
+    if UID_SOURCE == "mac":
+        mac_address = _get_mac_address_for_request()
+        if mac_address:
+            return mac_sessions.get(mac_address, {}).get(key, default)
+    return session.get(key, default)
+
+def set_session_value(key, value):
+    """設定 session 值（自動判斷 MAC 模式或 Flask session）"""
+    if UID_SOURCE == "mac":
+        mac_address = _get_mac_address_for_request()
+        if mac_address:
+            if mac_address not in mac_sessions:
+                mac_sessions[mac_address] = {}
+            mac_sessions[mac_address][key] = value
+            return
+    # Flask session 模式
+    session[key] = value
+    session.permanent = True
+    session.modified = True
 
 COLOR_PALETTE = [
     'hsl(0, 70%, 85%)',      # 0: Red
@@ -693,7 +727,10 @@ def get_notes_from_db(board_id, include_deleted=False):
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
-        limit = (MAX_NOTE_SHOW + MAX_ARCHIVED_NOTE_SHOW) if include_deleted else MAX_NOTE_SHOW
+        ch_cfg = get_channel_config(board_id)
+        max_notes = ch_cfg.get('max_notes', 200)
+        max_archived = ch_cfg.get('max_archived_notes', 200)
+        limit = (max_notes + max_archived) if include_deleted else max_notes
         
         if include_deleted:
             cursor.execute('''
@@ -757,6 +794,13 @@ def get_notes_from_db(board_id, include_deleted=False):
     except Exception as e:
         print(f"從資料庫取得 notes 失敗: {e}")
         return []
+
+def get_channel_config(board_id):
+    """根據 board_id 取得頻道設定"""
+    for ch in BOARD_MESSAGE_CHANNELS:
+        if ch['name'] == board_id:
+            return ch
+    return BOARD_MESSAGE_CHANNELS[0]
 
 def get_channel_name(interface, channel_index):
     """根據 channel index 取得 channel name"""
@@ -855,7 +899,7 @@ def onReceive(packet, interface):
                     except Exception as e:
                         print(f"  -> 更新 lora_msg_id 失敗: {e}")
                     
-                    socketio.emit('refresh_notes', {'board_id': BOARD_MESSAGE_CHANEL_NAME})
+                    socketio.emit('refresh_notes', {'board_id': note_info.get('board_id', BOARD_MESSAGE_CHANNELS[0]['name'])})
                 
                 del pending_ack[request_id]
         
@@ -875,8 +919,9 @@ def onReceive(packet, interface):
             channel_index = packet.get('channel', 'N/A')
             channel_name = get_channel_name(interface, channel_index) if channel_index != 'N/A' else 'N/A'
             
-            if channel_name != BOARD_MESSAGE_CHANEL_NAME:
-                # print(f"[略過] Channel '{channel_name}' 不符合目標 '{BOARD_MESSAGE_CHANEL_NAME}'")
+            active_channel_names = {ch['name'] for ch in active_channels}
+            if channel_name not in active_channel_names:
+                # print(f"[略過] Channel '{channel_name}' 不在可用頻道清單中")
                 return
 
             if IS_PRINT_LORA_PACKAGE:
@@ -916,7 +961,7 @@ def onReceive(packet, interface):
                     
                     if save_lora_note(
                         lora_msg_id=lora_msg_id,
-                        board_id=BOARD_MESSAGE_CHANEL_NAME,
+                        board_id=channel_name,
                         body=body,
                         bg_color=bg_color,
                         author_key=author_key,
@@ -924,7 +969,7 @@ def onReceive(packet, interface):
                     ):
                         should_refresh = True
                         print(f"  -> 已儲存訊息 (含 color_id={color_id}, author_key={author_key})，將在 60 秒後發送 USER ACK 命令")
-                        eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                        eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, channel_name)
                 else:
                     print(f"  -> 格式錯誤，應為 /msg [new,color_id,author_key]body")
                     
@@ -933,7 +978,7 @@ def onReceive(packet, interface):
                 print(f"[新訊息] lora_msg_id={lora_msg_id}, body={body}")
                 if save_lora_note(
                     lora_msg_id=lora_msg_id,
-                    board_id=BOARD_MESSAGE_CHANEL_NAME,
+                    board_id=channel_name,
                     body=body,
                     bg_color='',
                     author_key='',
@@ -941,7 +986,7 @@ def onReceive(packet, interface):
                 ):
                     should_refresh = True
                     print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
-                    eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                    eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, channel_name)
                     
             elif msg.startswith('/msg [') and ']' in msg:
                 end_bracket = msg.index(']')
@@ -962,7 +1007,7 @@ def onReceive(packet, interface):
                         if not lora_msg_id_exists(resend_lora_msg_id):
                             if save_lora_note(
                                 lora_msg_id=resend_lora_msg_id,
-                                board_id=BOARD_MESSAGE_CHANEL_NAME,
+                                board_id=channel_name,
                                 body=body,
                                 bg_color=bg_color,
                                 author_key=author_key,
@@ -971,7 +1016,7 @@ def onReceive(packet, interface):
                                 should_refresh = True
                                 print(f"[重發訊息寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
                                 print(f"  -> 已儲存訊息 (含 color_id={color_id}, author_key={author_key})，將在 60 秒後發送 USER ACK 命令")
-                                eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                                eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, channel_name)
                                 # 更新以此訊息為父訊息的回覆，將 is_temp_parent_note 設為 0
                                 try:
                                     conn = sqlite3.connect(DB_PATH)
@@ -990,7 +1035,7 @@ def onReceive(packet, interface):
                         else:
                             print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過建立資料")
                             print(f"  -> 但仍將在 60 秒後發送 USER ACK 命令")
-                            eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                            eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, channel_name)
                     else:
                         print(f"  -> 格式錯誤，應為 /msg [lora_msg_id,color_id,author_key]body")
                 else:
@@ -1001,7 +1046,7 @@ def onReceive(packet, interface):
                     if not lora_msg_id_exists(resend_lora_msg_id):
                         if save_lora_note(
                             lora_msg_id=resend_lora_msg_id,
-                            board_id=BOARD_MESSAGE_CHANEL_NAME,
+                            board_id=channel_name,
                             body=body,
                             bg_color='',
                             author_key='',
@@ -1010,7 +1055,7 @@ def onReceive(packet, interface):
                             should_refresh = True
                             print(f"[重發訊息寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
                             print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
-                            eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                            eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, channel_name)
                             # 更新以此訊息為父訊息的回覆，將 is_temp_parent_note 設為 0
                             try:
                                 conn = sqlite3.connect(DB_PATH)
@@ -1029,7 +1074,7 @@ def onReceive(packet, interface):
                     else:
                         print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過建立資料")
                         print(f"  -> 但仍將在 60 秒後發送 USER ACK 命令")
-                        eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                        eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, channel_name)
                     
             elif msg.startswith('/color [') and ']' in msg:
                 end_bracket = msg.index(']')
@@ -1143,14 +1188,14 @@ def onReceive(packet, interface):
                             INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
                                              created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, lora_node_id)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
-                        ''', (reply_note_id, reply_lora_msg_id, BOARD_MESSAGE_CHANEL_NAME, body, bg_color, status, 
+                        ''', (reply_note_id, reply_lora_msg_id, channel_name, body, bg_color, status, 
                               timestamp, timestamp, author_key, lora_msg_id, is_temp_parent, lora_uuid))
                         
                         conn.commit()
                         conn.close()
                         should_refresh = True
                         print(f"  -> 成功儲存回覆訊息 (含 color_id={color_id}, author_key={author_key})，將在 60 秒後發送 USER ACK 命令")
-                        eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                        eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, channel_name)
                     except Exception as e:
                         print(f"  -> 儲存回覆訊息失敗: {e}")
                 else:
@@ -1183,14 +1228,14 @@ def onReceive(packet, interface):
                         INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
                                          created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, lora_node_id)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
-                    ''', (reply_note_id, reply_lora_msg_id, BOARD_MESSAGE_CHANEL_NAME, body, '', status, 
+                    ''', (reply_note_id, reply_lora_msg_id, channel_name, body, '', status, 
                           timestamp, timestamp, '', lora_msg_id, is_temp_parent, lora_uuid))
                     
                     conn.commit()
                     conn.close()
                     should_refresh = True
                     print(f"  -> 成功儲存回覆訊息，將在 60 秒後發送 USER ACK 命令")
-                    eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                    eventlet.spawn_after(60, send_ack_delayed, lora_msg_id, interface, channel_name)
                 except Exception as e:
                     print(f"  -> 儲存回覆訊息失敗: {e}")
                     
@@ -1242,7 +1287,7 @@ def onReceive(packet, interface):
                                         INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
                                                          created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, lora_node_id)
                                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
-                                    ''', (reply_note_id, reply_lora_msg_id, BOARD_MESSAGE_CHANEL_NAME, body, bg_color, status, 
+                                    ''', (reply_note_id, reply_lora_msg_id, channel_name, body, bg_color, status, 
                                           timestamp, timestamp, author_key, resend_lora_msg_id, is_temp_parent, lora_uuid))
                                     
                                     conn.commit()
@@ -1259,7 +1304,7 @@ def onReceive(packet, interface):
                                     should_refresh = True
                                     print(f"[重發回覆寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
                                     print(f"  -> 已儲存訊息 (含 color_id={color_id}, author_key={author_key})，將在 60 秒後發送 USER ACK 命令")
-                                    eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                                    eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, channel_name)
                                     if updated_count > 0:
                                         print(f"  -> 已更新 {updated_count} 筆回覆的 is_temp_parent_note 為 0")
                                 except Exception as e:
@@ -1267,7 +1312,7 @@ def onReceive(packet, interface):
                             else:
                                 print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過建立資料")
                                 print(f"  -> 但仍將在 60 秒後發送 USER ACK 命令")
-                                eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                                eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, channel_name)
                         else:
                             print(f"  -> 格式錯誤，應為 /reply <lora_msg_id,color_id,author_key>[parent_lora_msg_id]body")
                     else:
@@ -1298,7 +1343,7 @@ def onReceive(packet, interface):
                                     INSERT INTO notes (note_id, reply_lora_msg_id, board_id, body, bg_color, status, 
                                                      created_at, updated_at, author_key, rev, deleted, lora_msg_id, is_temp_parent_note, lora_node_id)
                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
-                                ''', (reply_note_id, reply_lora_msg_id, BOARD_MESSAGE_CHANEL_NAME, body, '', status, 
+                                ''', (reply_note_id, reply_lora_msg_id, channel_name, body, '', status, 
                                       timestamp, timestamp, '', resend_lora_msg_id, is_temp_parent, lora_uuid))
                                 
                                 conn.commit()
@@ -1315,7 +1360,7 @@ def onReceive(packet, interface):
                                 should_refresh = True
                                 print(f"[重發回覆寫入資料庫成功] lora_msg_id={resend_lora_msg_id}, body={body}")
                                 print(f"  -> 已儲存訊息，將在 60 秒後發送 USER ACK 命令")
-                                eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                                eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, channel_name)
                                 if updated_count > 0:
                                     print(f"  -> 已更新 {updated_count} 筆回覆的 is_temp_parent_note 為 0")
                             except Exception as e:
@@ -1323,7 +1368,7 @@ def onReceive(packet, interface):
                         else:
                             print(f"  -> lora_msg_id {resend_lora_msg_id} 已存在，略過建立資料")
                             print(f"  -> 但仍將在 60 秒後發送 USER ACK 命令")
-                            eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, BOARD_MESSAGE_CHANEL_NAME)
+                            eventlet.spawn_after(60, send_ack_delayed, resend_lora_msg_id, interface, channel_name)
                     
             else:
                 if not msg.startswith('/'):
@@ -1332,7 +1377,7 @@ def onReceive(packet, interface):
                     print(f"[未知命令格式，已忽略] {msg}")
             
             if should_refresh:
-                socketio.emit('refresh_notes', {'board_id': BOARD_MESSAGE_CHANEL_NAME})
+                socketio.emit('refresh_notes', {'board_id': channel_name})
                 
     except Exception as e:
         print(f"Packet Error: {e}")
@@ -1371,7 +1416,7 @@ def check_ack_timeout():
         
         if update_note_status(note_id, 'LAN only'):
             print(f"  -> 更新 note {note_id} 狀態為 'LAN only'")
-            socketio.emit('refresh_notes', {'board_id': BOARD_MESSAGE_CHANEL_NAME})
+            socketio.emit('refresh_notes', {'board_id': info.get('board_id', BOARD_MESSAGE_CHANNELS[0]['name'])})
         
         del pending_ack[request_id]
 
@@ -1393,32 +1438,108 @@ def send_scheduler_loop():
                 print(f"[排程器] LoRa 設備正在等待 ACK，跳過此次處理")
                 continue
             
-            update_note = get_note_need_update_lora(BOARD_MESSAGE_CHANEL_NAME)
-            if update_note:
-                print(f"[排程器] 處理需要更新的 note_id={update_note['note_id']}")
+            # 遍歷所有可用頻道，處理需要更新和待發送的 notes
+            processed_any = False
+            for ch_cfg in active_channels:
+                ch_name = ch_cfg['name']
                 
-                if not update_note['lora_msg_id']:
-                    print(f"  -> 跳過：此 note 尚未發送至 LoRa，無 lora_msg_id")
+                if FLAG_DEVICE_WAITING_ACK:
+                    break
+                
+                update_note = get_note_need_update_lora(ch_name)
+                if update_note:
+                    processed_any = True
+                    print(f"[排程器] [{ch_name}] 處理需要更新的 note_id={update_note['note_id']}")
+                    
+                    if not update_note['lora_msg_id']:
+                        print(f"  -> 跳過：此 note 尚未發送至 LoRa，無 lora_msg_id")
+                        continue
+                    
+                    try:
+                        channel_index = get_channel_index(interface, ch_name)
+                        
+                        if update_note['deleted'] == 1:
+                            msg = f"/archive [{update_note['lora_msg_id']}]{update_note['author_key']}"
+                            print(f"  -> 發送 archive 命令: {msg}")
+                        else:
+                            color_index = get_color_index_from_palette(update_note['bg_color'])
+                            msg = f"/color [{update_note['lora_msg_id']}]{update_note['author_key']}, {color_index}"
+                            print(f"  -> 發送 color 命令: {msg}")
+                        
+                        interface.sendText(msg, channelIndex=channel_index)
+                        print(f"  -> 已發送更新命令")
+                        socketio.emit('refresh_notes', {'board_id': ch_name})
+                        
+                    except Exception as e:
+                        error_str = str(e)
+                        print(f"[排程器] 發送更新命令失敗: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        
+                        # 檢測 USB 連線異常
+                        if "Timed out waiting for connection completion" in error_str or \
+                           "device disconnected" in error_str or \
+                           "裝置路徑" in error_str and "已消失" in error_str:
+                            error_msg = "連線失敗：USB連線異常中斷，可能是 Pi 電力供應不足、更換線材、或 Mesh 裝置需要重啟"
+                            print(f"[排程器] {error_msg}")
+                            lora_connected = False
+                            FLAG_DEVICE_WAITING_ACK = False
+                            socketio.emit('usb_connection_error', {'message': error_msg})
+                            socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False})
+                    
                     continue
                 
+                note = get_oldest_lan_only_note(ch_name)
+                if not note:
+                    continue
+                
+                processed_any = True
+                print(f"[排程器] [{ch_name}] 準備發送 note_id={note['note_id']}")
+                print(f"  -> note 完整資料: {note}")
+                
                 try:
-                    channel_index = get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME)
+                    channel_index = get_channel_index(interface, ch_name)
                     
-                    if update_note['deleted'] == 1:
-                        msg = f"/archive [{update_note['lora_msg_id']}]{update_note['author_key']}"
-                        print(f"  -> 發送 archive 命令: {msg}")
+                    reply_lora_msg_id = note.get('reply_lora_msg_id')
+                    author_key = note.get('author_key', '')
+                    bg_color = note.get('bg_color', '')
+                    color_id = get_color_index_from_palette(bg_color)
+                    
+                    print(f"  -> reply_lora_msg_id 值: {reply_lora_msg_id} (type: {type(reply_lora_msg_id)})")
+                    print(f"  -> author_key: {author_key}, color_id: {color_id}")
+                    
+                    if reply_lora_msg_id:
+                        msg = f"/reply <new,{color_id},{author_key}>[{reply_lora_msg_id}]{note['body']}"
+                        print(f"  -> 使用 /reply 指令 (含 color_id 與 author_key): {msg}")
                     else:
-                        color_index = get_color_index_from_palette(update_note['bg_color'])
-                        msg = f"/color [{update_note['lora_msg_id']}]{update_note['author_key']}, {color_index}"
-                        print(f"  -> 發送 color 命令: {msg}")
+                        msg = f"/msg [new,{color_id},{author_key}]{note['body']}"
+                        print(f"  -> 使用 /msg 指令 (含 color_id 與 author_key): {msg}")
                     
-                    interface.sendText(msg, channelIndex=channel_index)
-                    print(f"  -> 已發送更新命令")
-                    socketio.emit('refresh_notes', {'board_id': BOARD_MESSAGE_CHANEL_NAME})
+                    result = interface.sendText(msg, channelIndex=channel_index, wantAck=True)
+                    
+                    if result:
+                        request_id = result.id if hasattr(result, 'id') else None
+                        if request_id:
+                            current_time = int(time.time())
+                            pending_ack[request_id] = {
+                                'note_id': note['note_id'],
+                                'author_key': note['author_key'],
+                                'bg_color': note['bg_color'],
+                                'board_id': ch_name,
+                                'timestamp': current_time
+                            }
+                            update_note_status(note['note_id'], 'Sending')
+                            print(f"  -> 已發送訊息，等待 ACK (request_id={request_id})")
+                            socketio.emit('refresh_notes', {'board_id': ch_name})
+                            FLAG_DEVICE_WAITING_ACK = True
+                        else:
+                            print(f"  -> 已發送訊息，但無 request_id")
+                    else:
+                        print(f"  -> 發送失敗")
                     
                 except Exception as e:
                     error_str = str(e)
-                    print(f"[排程器] 發送更新命令失敗: {e}")
+                    print(f"[排程器] 發送失敗: {e}")
                     import traceback
                     traceback.print_exc()
                     
@@ -1433,71 +1554,6 @@ def send_scheduler_loop():
                         socketio.emit('usb_connection_error', {'message': error_msg})
                         socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False})
                 
-                continue
-            
-            note = get_oldest_lan_only_note(BOARD_MESSAGE_CHANEL_NAME)
-            if not note:
-                continue
-            
-            print(f"[排程器] 準備發送 note_id={note['note_id']}")
-            print(f"  -> note 完整資料: {note}")
-            
-            try:
-                channel_index = get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME)
-                
-                reply_lora_msg_id = note.get('reply_lora_msg_id')
-                author_key = note.get('author_key', '')
-                bg_color = note.get('bg_color', '')
-                color_id = get_color_index_from_palette(bg_color)
-                
-                print(f"  -> reply_lora_msg_id 值: {reply_lora_msg_id} (type: {type(reply_lora_msg_id)})")
-                print(f"  -> author_key: {author_key}, color_id: {color_id}")
-                
-                if reply_lora_msg_id:
-                    msg = f"/reply <new,{color_id},{author_key}>[{reply_lora_msg_id}]{note['body']}"
-                    print(f"  -> 使用 /reply 指令 (含 color_id 與 author_key): {msg}")
-                else:
-                    msg = f"/msg [new,{color_id},{author_key}]{note['body']}"
-                    print(f"  -> 使用 /msg 指令 (含 color_id 與 author_key): {msg}")
-                
-                result = interface.sendText(msg, channelIndex=channel_index, wantAck=True)
-                
-                if result:
-                    request_id = result.id if hasattr(result, 'id') else None
-                    if request_id:
-                        current_time = int(time.time())
-                        pending_ack[request_id] = {
-                            'note_id': note['note_id'],
-                            'author_key': note['author_key'],
-                            'bg_color': note['bg_color'],
-                            'timestamp': current_time
-                        }
-                        update_note_status(note['note_id'], 'Sending')
-                        print(f"  -> 已發送訊息，等待 ACK (request_id={request_id})")
-                        socketio.emit('refresh_notes', {'board_id': BOARD_MESSAGE_CHANEL_NAME})
-                        FLAG_DEVICE_WAITING_ACK = True
-                    else:
-                        print(f"  -> 已發送訊息，但無 request_id")
-                else:
-                    print(f"  -> 發送失敗")
-                    
-            except Exception as e:
-                error_str = str(e)
-                print(f"[排程器] 發送失敗: {e}")
-                import traceback
-                traceback.print_exc()
-                
-                # 檢測 USB 連線異常
-                if "Timed out waiting for connection completion" in error_str or \
-                   "device disconnected" in error_str or \
-                   "裝置路徑" in error_str and "已消失" in error_str:
-                    error_msg = "連線失敗：USB連線異常中斷，可能是 Pi 電力供應不足、更換線材、或 Mesh 裝置需要重啟"
-                    print(f"[排程器] {error_msg}")
-                    lora_connected = False
-                    FLAG_DEVICE_WAITING_ACK = False
-                    socketio.emit('usb_connection_error', {'message': error_msg})
-                    socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False})
-                
         except Exception as e:
             error_str = str(e)
             print(f"[排程器] 錯誤: {e}")
@@ -1505,40 +1561,60 @@ def send_scheduler_loop():
             traceback.print_exc()
 
 def validate_channel_name(interface):
-    """驗證裝置的 channel name 是否與 config 中的設定一致"""
-    global channel_validated
+    """驗證裝置的 channel name 是否與 config 中的設定一致（支援多頻道）"""
+    global channel_validated, active_channels
     try:
         if not interface or not interface.localNode or not interface.localNode.channels:
+            active_channels = []
+            channel_validated = False
             return (False, f"無法讀取裝置 channel 資訊")
         
+        # 取得設備上的所有 channel 名稱（排除 index 0）
+        device_channels = {}
         for ch in interface.localNode.channels:
-            if ch.settings and ch.settings.name == BOARD_MESSAGE_CHANEL_NAME:
-                if ch.index == 0:
-                    channel_validated = False
-                    error_msg = f"Channel '{BOARD_MESSAGE_CHANEL_NAME}' 的 Index 不可以為 0"
-                    print(f"[✗] {error_msg}")
-                    return (False, error_msg)
-                
-                channel_validated = True
-                print(f"[✓] Channel 名稱驗證成功: '{BOARD_MESSAGE_CHANEL_NAME}' (Index: {ch.index})")
-                return (True, None)
+            if ch.settings and ch.index != 0:
+                device_channels[ch.settings.name] = ch.index
         
-        channel_validated = False
-        error_msg = f"Channel 名稱驗證失敗: 找不到名為 '{BOARD_MESSAGE_CHANEL_NAME}' 的 channel"
-        print(f"[✗] {error_msg}")
-        print(f"[✗] 可用的 channels:")
-        for ch in interface.localNode.channels:
-            if ch.settings:
-                print(f"    - Index {ch.index}: {ch.settings.name}")
-        return (False, error_msg)
+        # 逐個檢查設定中的頻道，是否存在於設備上
+        matched = []
+        not_found = []
+        for ch_cfg in BOARD_MESSAGE_CHANNELS:
+            ch_name = ch_cfg['name']
+            if ch_name in device_channels:
+                matched.append(ch_cfg)
+                print(f"[✓] Channel '{ch_name}' 驗證成功 (Index: {device_channels[ch_name]})")
+            else:
+                not_found.append(ch_name)
+                print(f"[✗] Channel '{ch_name}' 在設備上找不到，跳過此頻道")
+        
+        active_channels = matched
+        
+        if len(matched) > 0:
+            channel_validated = True
+            active_names = [ch['name'] for ch in matched]
+            print(f"[✓] 可用頻道: {active_names}")
+            if not_found:
+                error_msg = f"部分頻道未找到: {not_found}"
+                return (True, error_msg)
+            return (True, None)
+        else:
+            channel_validated = False
+            error_msg = f"Channel 驗證失敗: 設備上找不到任何設定中的頻道 ({CONFIGURED_CHANNEL_NAMES})"
+            print(f"[✗] {error_msg}")
+            print(f"[✗] 設備上可用的 channels:")
+            for ch in interface.localNode.channels:
+                if ch.settings:
+                    print(f"    - Index {ch.index}: {ch.settings.name}")
+            return (False, error_msg)
     except Exception as e:
         error_msg = f"Channel 驗證異常: {e}"
         print(f"[✗] {error_msg}")
+        active_channels = []
         channel_validated = False
         return (False, error_msg)
 
 def mesh_loop():
-    global interface, current_dev_path, lora_connected, channel_validated, deviceLastPosition, isDeviceProvideLocation, FLAG_DEVICE_WAITING_ACK
+    global interface, current_dev_path, lora_connected, channel_validated, active_channels, deviceLastPosition, isDeviceProvideLocation, FLAG_DEVICE_WAITING_ACK
     print("啟動 Meshtastic 自動偵測與監聽 (NoteBoard 模式)...")
     
     while True:
@@ -1547,7 +1623,8 @@ def mesh_loop():
                 if lora_connected:
                     lora_connected = False
                     channel_validated = False
-                    socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False})
+                    active_channels = []
+                    socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False, 'active_channels': []})
                 
                 target_port = scan_for_meshtastic()
                 if target_port:
@@ -1722,7 +1799,8 @@ def mesh_loop():
                         'online': True, 
                         'channel_validated': is_channel_valid,
                         'error_message': error_msg,
-                        'power_issue': False
+                        'power_issue': False,
+                        'active_channels': [ch['name'] for ch in active_channels]
                     })
                 else:
                     time.sleep(3)
@@ -1739,7 +1817,8 @@ def mesh_loop():
                         'online': True, 
                         'channel_validated': is_channel_valid,
                         'error_message': error_msg,
-                        'power_issue': False
+                        'power_issue': False,
+                        'active_channels': [ch['name'] for ch in active_channels]
                     })
 
         except Exception as e:
@@ -1755,7 +1834,8 @@ def mesh_loop():
             if lora_connected:
                 lora_connected = False
                 channel_validated = False
-                socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False})
+                active_channels = []
+                socketio.emit('lora_status', {'online': False, 'channel_validated': False, 'error_message': None, 'power_issue': False, 'active_channels': []})
                 
                 # 檢測 USB 連線異常，通知前端
                 if "裝置路徑" in error_str and "已消失" in error_str:
@@ -1768,12 +1848,20 @@ def mesh_loop():
             
         eventlet.sleep(2)
 
-@app.route('/api/config/channel_name', methods=['GET'])
-def get_channel_name_config():
-    """取得設定檔中的 channel name"""
+@app.route('/api/config/channels', methods=['GET'])
+def get_channels_config():
+    """取得所有頻道設定與可用狀態"""
+    configured = []
+    active_names = {ch['name'] for ch in active_channels}
+    for ch_cfg in BOARD_MESSAGE_CHANNELS:
+        configured.append({
+            'name': ch_cfg['name'],
+            'active': ch_cfg['name'] in active_names
+        })
     return jsonify({
         'success': True,
-        'channel_name': BOARD_MESSAGE_CHANEL_NAME
+        'configured_channels': configured,
+        'active_channels': [ch['name'] for ch in active_channels]
     })
 
 @app.route('/api/config/features', methods=['GET'])
@@ -1802,11 +1890,134 @@ def get_features_config():
 
 @app.route('/api/config/post_passcode_required', methods=['GET'])
 def get_post_passcode_required():
-    """檢查是否需要張貼通關碼"""
+    """檢查各頻道是否需要張貼通關碼"""
+    channels_passcode = {}
+    for ch in BOARD_MESSAGE_CHANNELS:
+        pcode = ch.get('post_passcode', '')
+        channels_passcode[ch['name']] = bool(pcode and pcode.strip())
+    
+    # 向下相容：如果有指定 board_id，回傳該頻道的狀態
+    board_id = request.args.get('board_id', '')
+    if board_id and board_id in channels_passcode:
+        return jsonify({
+            'success': True,
+            'required': channels_passcode[board_id]
+        })
+    
     return jsonify({
         'success': True,
-        'required': bool(NOTEBOARD_POST_PASSCODE and NOTEBOARD_POST_PASSCODE.strip())
+        'channels_post_passcode': channels_passcode
     })
+
+@app.route('/api/session/current_board', methods=['GET'])
+def get_current_board():
+    """取得當前 session 選擇的 board，如果沒有則回傳第一個可用頻道"""
+    current_board = get_session_value('selected_board', None)
+    if not current_board and active_channels:
+        current_board = active_channels[0]['name']
+    elif not current_board and CONFIGURED_CHANNEL_NAMES:
+        current_board = CONFIGURED_CHANNEL_NAMES[0]
+    
+    return jsonify({
+        'success': True,
+        'board_id': current_board
+    })
+
+@app.route('/api/session/select_board', methods=['POST'])
+def select_board():
+    """設定當前 session 選擇的 board"""
+    data = request.get_json()
+    board_id = data.get('board_id', '')
+    
+    if not board_id:
+        return jsonify({'success': False, 'error': 'board_id is required'}), 400
+    
+    # 驗證 board_id 是否在設定中
+    if board_id not in CONFIGURED_CHANNEL_NAMES:
+        return jsonify({'success': False, 'error': 'Invalid board_id'}), 400
+    
+    set_session_value('selected_board', board_id)
+    return jsonify({'success': True, 'board_id': board_id})
+
+@app.route('/api/channel/verify_password', methods=['POST'])
+def verify_channel_password():
+    """驗證頻道的 user_passcode"""
+    data = request.get_json()
+    channel_name = data.get('channel_name', '')
+    password = data.get('password', '')
+    
+    if not channel_name:
+        return jsonify({'success': False, 'error': 'channel_name is required'}), 400
+    
+    # 找到對應的頻道設定
+    channel_config = None
+    for ch in BOARD_MESSAGE_CHANNELS:
+        if ch['name'] == channel_name:
+            channel_config = ch
+            break
+    
+    if not channel_config:
+        return jsonify({'success': False, 'error': 'Channel not found'}), 404
+    
+    # 檢查是否需要密碼
+    required_password = channel_config.get('user_passcode', '')
+    if not required_password:
+        # 不需要密碼，直接通過
+        verified = list(get_session_value('verified_channels', []))
+        if channel_name not in verified:
+            verified.append(channel_name)
+        set_session_value('verified_channels', verified)
+        return jsonify({'success': True, 'verified': True})
+    
+    # 驗證密碼
+    if password == required_password:
+        verified = list(get_session_value('verified_channels', []))
+        if channel_name not in verified:
+            verified.append(channel_name)
+        set_session_value('verified_channels', verified)
+        return jsonify({'success': True, 'verified': True})
+    else:
+        return jsonify({'success': False, 'error': 'Incorrect password', 'verified': False}), 401
+
+@app.route('/api/channel/verified_status', methods=['GET'])
+def get_verified_status():
+    """取得所有頻道的驗證狀態和密碼要求"""
+    verified_channels = get_session_value('verified_channels', [])
+    
+    channels_status = []
+    for ch in BOARD_MESSAGE_CHANNELS:
+        channel_name = ch['name']
+        requires_password = bool(ch.get('user_passcode', ''))
+        is_verified = channel_name in verified_channels or not requires_password
+        
+        channels_status.append({
+            'name': channel_name,
+            'requires_password': requires_password,
+            'is_verified': is_verified
+        })
+    
+    return jsonify({
+        'success': True,
+        'channels': channels_status
+    })
+
+def verify_channel_access(board_id):
+    """驗證用戶是否有權限訪問指定頻道"""
+    channel_config = None
+    for ch in BOARD_MESSAGE_CHANNELS:
+        if ch['name'] == board_id:
+            channel_config = ch
+            break
+    
+    if not channel_config:
+        return False, jsonify({'success': False, 'error': 'Board not found'}), 404
+    
+    if channel_config.get('user_passcode', ''):
+        verified_channels = get_session_value('verified_channels', [])
+        if board_id not in verified_channels:
+            return False, jsonify({'success': False, 'error': 'Channel password verification required'}), 403
+    
+    return True, None, None
 
 @app.route('/api/config/map_init_location', methods=['GET'])
 def get_map_init_location():
@@ -1867,21 +2078,29 @@ def get_user_uuid():
             'uuid': user_uuid
         })
 
+def is_channel_admin(board_id):
+    """檢查當前 session 是否為指定頻道的管理者（支援 MAC 模式）"""
+    admin_channels = get_session_value('admin_channels', [])
+    return board_id in admin_channels
+
 @app.route('/api/user/admin/status', methods=['GET'])
 def get_admin_status():
-    """檢查當前用戶是否為管理者"""
+    """取得所有頻道的管理者狀態"""
     try:
-        if UID_SOURCE == "mac":
-            client_ip = request.remote_addr
-            mac_address = mac_from_ip(client_ip)
-            user_uuid = mac_address if mac_address else get_or_create_user_uuid()
-        else:
-            user_uuid = get_or_create_user_uuid()
+        board_id = request.args.get('board_id', '')
+        admin_channels = get_session_value('admin_channels', [])
         
-        is_admin = user_uuid in admin_users
+        if board_id:
+            is_admin = board_id in admin_channels
+            return jsonify({
+                'success': True,
+                'is_admin': is_admin,
+                'board_id': board_id
+            })
+        
         return jsonify({
             'success': True,
-            'is_admin': is_admin
+            'admin_channels': admin_channels
         })
     except Exception as e:
         print(f"檢查管理者狀態失敗: {e}")
@@ -1892,10 +2111,11 @@ def get_admin_status():
 
 @app.route('/api/user/admin/authenticate', methods=['POST'])
 def authenticate_admin():
-    """驗證管理者 passcode"""
+    """驗證指定頻道的管理者 passcode"""
     try:
         data = request.get_json()
         passcode = data.get('passcode', '')
+        board_id = data.get('board_id', '')
         
         if not passcode:
             return jsonify({
@@ -1903,25 +2123,43 @@ def authenticate_admin():
                 'error': 'Passcode is required'
             }), 400
         
-        if passcode != NOTEBOARD_ADMIN_PASSCODE:
+        if not board_id:
+            return jsonify({
+                'success': False,
+                'error': 'board_id is required'
+            }), 400
+        
+        # 找到對應頻道的 admin_passcode
+        channel_config = None
+        for ch in BOARD_MESSAGE_CHANNELS:
+            if ch['name'] == board_id:
+                channel_config = ch
+                break
+        
+        if not channel_config:
+            return jsonify({
+                'success': False,
+                'error': 'Channel not found'
+            }), 404
+        
+        channel_admin_passcode = channel_config.get('admin_passcode', '')
+        if not channel_admin_passcode or passcode != channel_admin_passcode:
             return jsonify({
                 'success': False,
                 'error': 'Invalid passcode'
             }), 401
         
-        if UID_SOURCE == "mac":
-            client_ip = request.remote_addr
-            mac_address = mac_from_ip(client_ip)
-            user_uuid = mac_address if mac_address else get_or_create_user_uuid()
-        else:
-            user_uuid = get_or_create_user_uuid()
+        admin_channels = list(get_session_value('admin_channels', []))
+        if board_id not in admin_channels:
+            admin_channels.append(board_id)
+        set_session_value('admin_channels', admin_channels)
         
-        admin_users.add(user_uuid)
-        print(f"用戶 {user_uuid} 已認證為管理者")
+        print(f"Session 已認證為頻道 '{board_id}' 的管理者")
         
         return jsonify({
             'success': True,
-            'is_admin': True
+            'is_admin': True,
+            'board_id': board_id
         })
     except Exception as e:
         print(f"管理者認證失敗: {e}")
@@ -1932,22 +2170,28 @@ def authenticate_admin():
 
 @app.route('/api/user/admin/logout', methods=['POST'])
 def logout_admin():
-    """登出管理者身份"""
+    """登出指定頻道的管理者身份"""
     try:
-        if UID_SOURCE == "mac":
-            client_ip = request.remote_addr
-            mac_address = mac_from_ip(client_ip)
-            user_uuid = mac_address if mac_address else get_or_create_user_uuid()
-        else:
-            user_uuid = get_or_create_user_uuid()
+        data = request.get_json() or {}
+        board_id = data.get('board_id', '')
         
-        if user_uuid in admin_users:
-            admin_users.remove(user_uuid)
-            print(f"用戶 {user_uuid} 已登出管理者身份")
+        if not board_id:
+            return jsonify({
+                'success': False,
+                'error': 'board_id is required'
+            }), 400
+        
+        admin_channels = list(get_session_value('admin_channels', []))
+        if board_id in admin_channels:
+            admin_channels.remove(board_id)
+        set_session_value('admin_channels', admin_channels)
+        
+        print(f"Session 已登出頻道 '{board_id}' 的管理者身份")
         
         return jsonify({
             'success': True,
-            'is_admin': False
+            'is_admin': False,
+            'board_id': board_id
         })
     except Exception as e:
         print(f"管理者登出失敗: {e}")
@@ -1959,6 +2203,11 @@ def logout_admin():
 @app.route('/api/boards/<board_id>/notes', methods=['GET'])
 def get_board_notes(board_id):
     """取得指定 board 的所有 notes，包含 reply_notes 階層結構"""
+    # 驗證頻道訪問權限
+    has_access, error_response, status_code = verify_channel_access(board_id)
+    if not has_access:
+        return error_response, status_code
+    
     is_include_deleted = request.args.get('is_include_deleted', 'false').lower() == 'true'
     
     # 當 is_include_deleted=False 時，仍需取得所有 notes 以正確處理 reply 關係
@@ -2098,6 +2347,11 @@ def get_board_notes(board_id):
 @app.route('/api/boards/<board_id>/notes', methods=['POST'])
 def create_board_note(board_id):
     """建立新的 note (LAN only 模式)，支援 parent_note_id 來建立回覆"""
+    # 驗證頻道訪問權限
+    has_access, error_response, status_code = verify_channel_access(board_id)
+    if not has_access:
+        return error_response, status_code
+    
     try:
         data = request.get_json()
         text = data.get('text', '').strip()
@@ -2113,17 +2367,17 @@ def create_board_note(board_id):
             }), 400
         
         # 檢查是否需要驗證張貼通關碼（非管理者時）
-        if UID_SOURCE == "mac":
-            client_ip = request.remote_addr
-            mac_address = mac_from_ip(client_ip)
-            user_uuid = mac_address if mac_address else get_or_create_user_uuid()
-        else:
-            user_uuid = get_or_create_user_uuid()
+        admin_for_board = is_channel_admin(board_id)
         
-        is_admin = user_uuid in admin_users
+        # 取得該頻道的 post_passcode
+        channel_post_passcode = ''
+        for ch in BOARD_MESSAGE_CHANNELS:
+            if ch['name'] == board_id:
+                channel_post_passcode = ch.get('post_passcode', '')
+                break
         
-        if not is_admin and NOTEBOARD_POST_PASSCODE and NOTEBOARD_POST_PASSCODE.strip():
-            if post_passcode != NOTEBOARD_POST_PASSCODE:
+        if not admin_for_board and channel_post_passcode and channel_post_passcode.strip():
+            if post_passcode != channel_post_passcode:
                 return jsonify({
                     'success': False,
                     'error': '發送用通關碼錯誤'
@@ -2225,6 +2479,10 @@ def create_board_note(board_id):
 @app.route('/api/boards/<board_id>/notes/<note_id>', methods=['PUT'])
 def update_board_note(board_id, note_id):
     """更新 note 的內容與顏色 (僅限 author 本人且 status 為 LAN only)"""
+    # 驗證頻道訪問權限
+    has_access, error_response, status_code = verify_channel_access(board_id)
+    if not has_access:
+        return error_response, status_code
     try:
         data = request.get_json()
         text = data.get('text', '').strip()
@@ -2299,6 +2557,10 @@ def update_board_note(board_id, note_id):
 @app.route('/api/boards/<board_id>/notes/<note_id>/archive', methods=['POST'])
 def archive_board_note(board_id, note_id):
     """封存 note (僅限 author 本人或管理者，且 status 非 LAN only)"""
+    # 驗證頻道訪問權限
+    has_access, error_response, status_code = verify_channel_access(board_id)
+    if not has_access:
+        return error_response, status_code
     try:
         data = request.get_json() or {}
         author_key = data.get('author_key', 'user-unknown')
@@ -2313,7 +2575,7 @@ def archive_board_note(board_id, note_id):
             current_user_uuid = get_or_create_user_uuid()
         
         # 驗證管理者身份
-        is_verified_admin = is_admin_request and (current_user_uuid in admin_users)
+        is_verified_admin = is_admin_request and is_channel_admin(board_id)
         
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -2378,6 +2640,10 @@ def archive_board_note(board_id, note_id):
 @app.route('/api/boards/<board_id>/notes/<note_id>/color', methods=['POST'])
 def change_note_color(board_id, note_id):
     """變更 note 顏色 (僅限 author 本人或管理者，且 status 非 LAN only)"""
+    # 驗證頻道訪問權限
+    has_access, error_response, status_code = verify_channel_access(board_id)
+    if not has_access:
+        return error_response, status_code
     try:
         data = request.get_json() or {}
         author_key = data.get('author_key', 'user-unknown')
@@ -2385,14 +2651,7 @@ def change_note_color(board_id, note_id):
         is_admin_action = data.get('is_admin', False)
         
         # 檢查是否為管理者
-        if UID_SOURCE == "mac":
-            client_ip = request.remote_addr
-            mac_address = mac_from_ip(client_ip)
-            user_uuid = mac_address if mac_address else get_or_create_user_uuid()
-        else:
-            user_uuid = get_or_create_user_uuid()
-        
-        is_admin_user = user_uuid in admin_users
+        is_admin_user = is_channel_admin(board_id)
         
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -2456,6 +2715,11 @@ def change_note_color(board_id, note_id):
 @app.route('/api/boards/<board_id>/notes/<note_id>/pin', methods=['POST'])
 def pin_board_note(board_id, note_id):
     """置頂 note (僅限管理者)"""
+    # 驗證頻道訪問權限
+    has_access, error_response, status_code = verify_channel_access(board_id)
+    if not has_access:
+        return error_response, status_code
+    
     global interface, lora_connected, FLAG_DEVICE_WAITING_ACK
     
     if FLAG_DEVICE_WAITING_ACK:
@@ -2471,14 +2735,7 @@ def pin_board_note(board_id, note_id):
         }), 503
     
     try:
-        if UID_SOURCE == "mac":
-            client_ip = request.remote_addr
-            mac_address = mac_from_ip(client_ip)
-            user_uuid = mac_address if mac_address else get_or_create_user_uuid()
-        else:
-            user_uuid = get_or_create_user_uuid()
-        
-        if user_uuid not in admin_users:
+        if not is_channel_admin(board_id):
             return jsonify({
                 'success': False,
                 'error': 'Not authorized - admin only'
@@ -2583,6 +2840,10 @@ def pin_board_note(board_id, note_id):
 @app.route('/api/boards/<board_id>/notes/<note_id>', methods=['DELETE'])
 def delete_board_note(board_id, note_id):
     """刪除 note (僅限 author 本人且 status 為 LAN only)"""
+    # 驗證頻道訪問權限
+    has_access, error_response, status_code = verify_channel_access(board_id)
+    if not has_access:
+        return error_response, status_code
     try:
         data = request.get_json() or {}
         author_key = data.get('author_key', 'user-unknown')
@@ -2648,6 +2909,11 @@ def delete_board_note(board_id, note_id):
 @app.route('/api/boards/<board_id>/notes/<note_id>/resend', methods=['POST'])
 def resend_board_note(board_id, note_id):
     """重新發送 note (僅限 status 為 LoRa sent 的 note)"""
+    # 驗證頻道訪問權限
+    has_access, error_response, status_code = verify_channel_access(board_id)
+    if not has_access:
+        return error_response, status_code
+    
     global interface, lora_connected, pending_ack, FLAG_DEVICE_WAITING_ACK
     
     if FLAG_DEVICE_WAITING_ACK:
@@ -2669,14 +2935,7 @@ def resend_board_note(board_id, note_id):
         
         # 驗證管理者身份
         if is_admin:
-            if UID_SOURCE == "mac":
-                client_ip = request.remote_addr
-                mac_address = mac_from_ip(client_ip)
-                user_uuid = mac_address if mac_address else get_or_create_user_uuid()
-            else:
-                user_uuid = get_or_create_user_uuid()
-            
-            if user_uuid not in admin_users:
+            if not is_channel_admin(board_id):
                 return jsonify({
                     'success': False,
                     'error': 'Not authorized as admin'
@@ -2743,7 +3002,7 @@ def resend_board_note(board_id, note_id):
         
         # 根據是否為回覆決定使用 /msg 或 /reply 指令
         try:
-            channel_index = get_channel_index(interface, BOARD_MESSAGE_CHANEL_NAME)
+            channel_index = get_channel_index(interface, board_id)
             
             # 取得 color_id
             color_id = get_color_index_from_palette(bg_color)
@@ -2814,6 +3073,10 @@ def resend_board_note(board_id, note_id):
 @app.route('/api/boards/<board_id>/notes/<note_id>/acks', methods=['GET'])
 def get_note_acks(board_id, note_id):
     """取得指定 note 的 ACK 記錄"""
+    # 驗證頻道訪問權限
+    has_access, error_response, status_code = verify_channel_access(board_id)
+    if not has_access:
+        return error_response, status_code
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -3789,7 +4052,12 @@ def gen_204():
 
 @socketio.on('connect')
 def handle_connect():
-    emit('lora_status', {'online': lora_connected, 'channel_validated': channel_validated, 'error_message': None})
+    emit('lora_status', {
+        'online': lora_connected,
+        'channel_validated': channel_validated,
+        'error_message': None,
+        'active_channels': [ch['name'] for ch in active_channels]
+    })
 
 def run_noteboard_app():
     init_database()
@@ -3806,5 +4074,5 @@ def run_noteboard_app():
     
     socketio.start_background_task(target=mesh_loop)
     socketio.start_background_task(target=send_scheduler_loop)
-    print(f"MeshBridge NoteBoard 伺服器啟動中 (Port 80, Channel: {BOARD_MESSAGE_CHANEL_NAME})...")
+    print(f"MeshBridge NoteBoard 伺服器啟動中 (Port 80, Channels: {CONFIGURED_CHANNEL_NAMES})...")
     socketio.run(app, host='0.0.0.0', port=80, debug=False)
